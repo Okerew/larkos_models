@@ -1,0 +1,4 @@
+numpy
+sentence-transformers
+pyarrow
+datasets

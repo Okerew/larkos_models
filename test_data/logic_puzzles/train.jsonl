@@ -1,0 +1,50 @@
+{"text": "If all mammals are warm-blooded, and a whale is a mammal, then a whale is warm-blooded. Modus ponens applied."}
+{"text": "Premise one: All birds have feathers. Premise two: A penguin is a bird. Conclusion: A penguin has feathers."}
+{"text": "If P implies Q and Q implies R, then P implies R. This is the law of hypothetical syllogism."}
+{"text": "Modus tollens: If it rains then the ground is wet. The ground is not wet. Therefore it is not raining."}
+{"text": "Disjunctive syllogism: Either A or B is true. A is false. Therefore B is true."}
+{"text": "If all cats are animals and no animals are plants, then no cats are plants. Universal syllogism applied."}
+{"text": "Contrapositive: If P then Q is equivalent to if not Q then not P. Both carry the same truth value."}
+{"text": "De Morgan's first law: Not A and not B is equivalent to not the proposition A or B."}
+{"text": "De Morgan's second law: Not A or not B is equivalent to not the proposition A and B."}
+{"text": "A biconditional P if and only if Q means P implies Q and Q implies P both hold simultaneously."}
+{"text": "If exactly one of A or B is true (XOR), then A and B have different truth values."}
+{"text": "Puzzle: Alice always tells the truth. Bob always lies. Alice says Bob is a liar. Since Alice tells truth, Bob is indeed a liar. Consistent."}
+{"text": "Puzzle: Three boxes contain apples, oranges, or both. All labels are wrong. The label 'apples and oranges' must contain only one type. Opening it determines all three."}
+{"text": "If no X is Y and some Z are X, then some Z are not Y. Valid syllogism by contradiction."}
+{"text": "A tautology is true in all possible truth-value assignments. P or not P is always true regardless of P."}
+{"text": "A contradiction is false in all possible assignments. P and not P is always false regardless of P."}
+{"text": "Puzzle: Five people sit in a row. Alice is not next to Bob. Carol sits at one end. Dave is between Eve and Carol. Determine positions from constraints."}
+{"text": "Proof by contradiction: Assume the conclusion is false. Derive a logical impossibility. Therefore the conclusion must be true."}
+{"text": "Universal instantiation: If all x satisfy predicate P, then any specific element a also satisfies P."}
+{"text": "Existential generalisation: If a specific element a satisfies predicate P, then there exists some x satisfying P."}
+{"text": "Puzzle: A farmer has chickens and rabbits. There are 20 heads and 56 legs. Eight rabbits and twelve chickens satisfy both constraints."}
+{"text": "If premises lead to a contradiction, at least one premise is false. This is the basis of reductio ad absurdum."}
+{"text": "Conjunction elimination: If A and B is true, then A is true and B is true separately."}
+{"text": "Conjunction introduction: If A is true and B is true independently, then A and B is true."}
+{"text": "Disjunction introduction: If A is true, then A or B is true for any B, since at least one disjunct is satisfied."}
+{"text": "Puzzle: In a room of 23 people, the probability that two share a birthday exceeds 50 percent. This is the birthday paradox."}
+{"text": "Implication is false only when the antecedent is true and the consequent is false."}
+{"text": "Puzzle: Knights always tell truth, knaves always lie. A says we are both knaves. A must be a knave, B must be a knight."}
+{"text": "Resolution rule: From A or B and not A or C, conclude B or C. Fundamental in automated theorem proving."}
+{"text": "Puzzle: Alice, Bob, Carol are doctors, lawyers, engineers. Alice is not a doctor. Bob is not a lawyer. Carol is not an engineer. Use process of elimination."}
+{"text": "If A implies B and A implies not B, then A must be false by explosion combined with consistency."}
+{"text": "Abductive reasoning: The ground is wet. Rain is the simplest explanation. Therefore it probably rained. This is inference to the best explanation."}
+{"text": "Puzzle: A man has two coins totalling 30 cents. One is not a nickel. The other coin is a nickel. The first coin is a quarter."}
+{"text": "Inductive reasoning: All observed ravens are black. This is evidence but not proof that all ravens are black."}
+{"text": "Puzzle: A clock shows 3:15. The angle between the hour and minute hands is 7.5 degrees, not zero."}
+{"text": "If P is necessary for Q, then Q cannot be true without P. Necessity constrains possibility."}
+{"text": "If P is sufficient for Q, then P alone guarantees Q regardless of anything else."}
+{"text": "Puzzle: Find two natural numbers whose sum is 11 and product is 24. The answer is 3 and 8."}
+{"text": "A valid argument preserves truth from premises to conclusion. A sound argument is valid and has true premises."}
+{"text": "Puzzle: A boat has a ladder with rungs 30 cm apart. The bottom rung is at water level. As the tide rises 90 cm, two rungs are submerged because the boat rises with the tide."}
+{"text": "Propositional calculus treats sentences as atomic units. Predicate calculus decomposes sentences into subjects and predicates."}
+{"text": "If A is both necessary and sufficient for B then A if and only if B. The conditions are interchangeable."}
+{"text": "Puzzle: You have a 3-litre and 5-litre jug. Fill the 5-litre, pour into 3-litre, leaving 2 litres. Empty the 3-litre. Pour 2 litres in. Fill 5-litre again. Pour 1 litre into 3-litre. Result: 4 litres in 5-litre jug."}
+{"text": "Zeno's paradox: Achilles gives a tortoise a head start. Each time Achilles reaches where the tortoise was, it has moved ahead. Yet convergent series shows Achilles overtakes."}
+{"text": "Logical equivalence: Two statements are equivalent when they have the same truth table."}
+{"text": "Puzzle: Three missionaries and three cannibals cross a river in a boat holding two. Never let cannibals outnumber missionaries on either bank. Solve with six steps."}
+{"text": "Existential instantiation: From there exists x satisfying P, we may name that x and work with it, but cannot overgeneralise."}
+{"text": "Puzzle: A store sells red and blue balls. If you pick three at random you always get at least one red and one blue. The drawer has exactly two of each colour."}
+{"text": "Double negation: Not not P is equivalent to P in classical logic but not in intuitionistic logic."}
+{"text": "Puzzle: Four people must cross a bridge at night with one torch. They cross in pairs at the speed of the slower person. Crossing times 1, 2, 5, 10. Minimum total time is 17 minutes."}

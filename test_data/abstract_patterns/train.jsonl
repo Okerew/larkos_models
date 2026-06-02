@@ -1,0 +1,50 @@
+{"text": "Sequence: 1, 1, 2, 3, 5, 8, 13, 21. Each term is the sum of the two preceding terms. This is the Fibonacci sequence."}
+{"text": "Pattern: ABAB. The next two elements are AB. The pattern repeats with period two."}
+{"text": "Sequence: 2, 4, 8, 16, 32. Each term doubles the previous. The rule is multiplication by two."}
+{"text": "Pattern: circle triangle square circle triangle square. The next shape is circle. The pattern repeats with period three."}
+{"text": "Sequence: 1, 4, 9, 16, 25. Each term is the square of its position. The next term is 36."}
+{"text": "Rule: each element transforms by adding the position index. Input 3 at position 4 gives output 7."}
+{"text": "Sequence: 3, 6, 12, 24, 48. Each term doubles. This is a geometric sequence with ratio 2."}
+{"text": "Pattern: AABB AABB. The next four elements are AABB. The period is four."}
+{"text": "Sequence: 1, 3, 7, 15, 31. Each term is double the previous plus 1. The next is 63."}
+{"text": "Rule: transform each symbol by rotating one position in the alphabet. A becomes B, Z becomes A."}
+{"text": "Sequence: 0, 1, 4, 9, 16, 25. These are perfect squares starting from zero."}
+{"text": "Pattern: red blue green red blue green. The underlying rule is cyclic repetition of three colours."}
+{"text": "Sequence: 1, 2, 6, 24, 120. Each term is the factorial of its position. The next is 720."}
+{"text": "Rule: the output is the mirror of the input sequence. Input ABCDE gives output EDCBA."}
+{"text": "Sequence: 10, 7, 4, 1, -2. Each term decreases by 3. The arithmetic difference is constant at negative 3."}
+{"text": "Pattern: one circle inside a square, two circles inside a square, three circles. The number of inner shapes increments by one."}
+{"text": "Sequence: 1, 1, 2, 6, 24, 120. The differences 0, 1, 4, 18, 96 are products of consecutive integers."}
+{"text": "Rule: pairs of symbols are swapped. AB CD EF becomes BA DC FE."}
+{"text": "Sequence: 100, 50, 25, 12.5. Each term is halved. The ratio is one half."}
+{"text": "Pattern: large small large small. The property alternates with period two."}
+{"text": "Sequence: 1, 8, 27, 64, 125. These are perfect cubes. Each term is the cube of its position."}
+{"text": "Rule: every third element is replaced by its successor. ABC ABC becomes ABD ABD if D follows C."}
+{"text": "Sequence: 2, 3, 5, 7, 11, 13. These are prime numbers in order. The next is 17."}
+{"text": "Pattern: a nest of rules. Odd positions increase by 2. Even positions decrease by 1. Starting from 0: 0, -1, 2, 0, 4, 2."}
+{"text": "Rule: compose two transformations. First double, then subtract 3. Input 4 gives 5. Input 7 gives 11."}
+{"text": "Sequence: 1, 3, 6, 10, 15, 21. These are triangular numbers. Each is the sum of natural numbers up to its index."}
+{"text": "Pattern: ABCBA. The sequence is a palindrome. Reading forwards or backwards gives the same order."}
+{"text": "Rule: the number of distinct elements in a window of size 3 encodes the complexity. Window AAB has complexity 2."}
+{"text": "Sequence: 256, 16, 4, 2. Each term is the square root of the previous. The next is the square root of 2."}
+{"text": "Pattern: XOX OXO XOX. The grid alternates on a checkerboard layout with period two in both dimensions."}
+{"text": "Sequence: 1, -1, 1, -1, 1. The sign alternates with each term. This is multiplication by negative one."}
+{"text": "Rule: insert the position number between each pair of symbols. AB at positions 1, 2 becomes A1B."}
+{"text": "Sequence: 0, 1, 0, 0, 1, 1, 0, 1, 1, 1. The binary representation of natural numbers concatenated."}
+{"text": "Pattern: small grows to large then returns to small. The cycle has three stages: growth, peak, decay."}
+{"text": "Rule: the parity of consecutive differences encodes the next element. Even difference predicts repetition, odd difference predicts change."}
+{"text": "Sequence: 1, 10, 100, 1000. Powers of ten. Each term multiplies by ten."}
+{"text": "Pattern: element n depends on elements n minus 1 and n minus 2. This recurrence generates families of sequences from initial conditions."}
+{"text": "Rule: the sequence encodes runs. 111 00 1111 is represented as three ones, two zeros, four ones."}
+{"text": "Sequence: 1, 2, 4, 7, 11, 16, 22. The differences are 1, 2, 3, 4, 5, 6. Second-order constant differences."}
+{"text": "Pattern: each shape contains the previous shapes nested inside it. Triangle contains nothing, square contains triangle, pentagon contains square."}
+{"text": "Rule: the transformation is its own inverse. Applying it twice returns the original. This is an involution."}
+{"text": "Sequence: 0, 0, 0, 1, 0, 0, 0, 1. The pattern has period four with a spike at position four."}
+{"text": "Pattern: the elements form a group under some operation. Applying the operation to any two elements produces another element in the set."}
+{"text": "Sequence: 5, 5, 5, 5. A constant sequence. The rule is the identity transformation."}
+{"text": "Rule: replace each element by its frequency of occurrence in the sequence so far. First occurrence gets 1, second gets 2, and so on."}
+{"text": "Sequence: 1, 2, 3, 5, 8, 13, 21, 34. Fibonacci-like with initial values 1 and 2."}
+{"text": "Pattern: the boundary of a fractal is self-similar. Zooming into any region reveals the same structure as the whole."}
+{"text": "Rule: the sequence encodes sorted order. An element is 1 if it would be in its correct sorted position and 0 otherwise."}
+{"text": "Sequence: 0, 1, 3, 6, 10, 15. Triangular numbers. The difference between consecutive terms increases by 1."}
+{"text": "Pattern: elements rotate by one position each step. ABCD becomes DABC then CDAB then BCDA then returns to ABCD."}

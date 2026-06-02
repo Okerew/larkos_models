@@ -1,0 +1,50 @@
+{"text": "The derivative of x squared with respect to x is 2x. This follows from the power rule: d/dx of x to the n equals n times x to the n minus 1."}
+{"text": "The integral of 2x with respect to x is x squared plus a constant C. Integration is the inverse operation of differentiation."}
+{"text": "The derivative of the natural logarithm ln x is 1 divided by x, valid for x greater than zero."}
+{"text": "The integral of 1 over x from 1 to e equals 1, because the antiderivative is ln x and ln e minus ln 1 equals 1 minus 0."}
+{"text": "By the chain rule, the derivative of sin of x squared is 2x times cosine of x squared."}
+{"text": "The product rule: if f and g are differentiable, then the derivative of their product is f prime g plus f g prime."}
+{"text": "The quadratic formula gives solutions x equals negative b plus or minus square root of b squared minus 4ac all divided by 2a."}
+{"text": "The discriminant b squared minus 4ac determines the nature of roots: positive means two real roots, zero means one repeated root, negative means two complex roots."}
+{"text": "By the Pythagorean theorem, in a right triangle with legs a and b and hypotenuse c, we have a squared plus b squared equals c squared."}
+{"text": "The area of a circle with radius r is pi r squared. The circumference is 2 pi r."}
+{"text": "Euler's formula states that e to the power of i times theta equals cosine theta plus i sine theta."}
+{"text": "The fundamental theorem of calculus connects differentiation and integration: the definite integral of f prime from a to b equals f of b minus f of a."}
+{"text": "A geometric series with first term a and ratio r less than 1 has sum a divided by the quantity 1 minus r."}
+{"text": "The sum of the first n natural numbers equals n times n plus 1 divided by 2. For n equals 10, the sum is 55."}
+{"text": "By induction: prove for n equals 1, assume for n equals k, then prove for n equals k plus 1. This establishes truth for all natural numbers."}
+{"text": "Fermat's little theorem: if p is prime and a is not divisible by p, then a to the power p minus 1 is congruent to 1 modulo p."}
+{"text": "The binomial theorem expands the quantity a plus b to the n as the sum from k equals 0 to n of binomial coefficient n choose k times a to the n minus k times b to the k."}
+{"text": "The greatest common divisor of 48 and 18 is 6. The Euclidean algorithm: 48 equals 2 times 18 plus 12; 18 equals 1 times 12 plus 6; 12 equals 2 times 6 plus 0."}
+{"text": "A prime number has exactly two positive divisors: 1 and itself. The primes below 20 are 2, 3, 5, 7, 11, 13, 17, 19."}
+{"text": "The dot product of vectors u and v equals the magnitude of u times the magnitude of v times cosine of the angle between them."}
+{"text": "The cross product of two vectors in three dimensions is a vector perpendicular to both, with magnitude equal to the area of the parallelogram they span."}
+{"text": "A matrix is invertible if and only if its determinant is nonzero. The determinant of a 2 by 2 matrix with entries a, b, c, d is ad minus bc."}
+{"text": "The eigenvalues of a matrix A satisfy the characteristic polynomial det of A minus lambda times I equals zero."}
+{"text": "By Bayes' theorem, the posterior probability of A given B equals the likelihood of B given A times the prior of A divided by the evidence of B."}
+{"text": "The expected value of a discrete random variable X is the sum of x times the probability that X equals x over all values x."}
+{"text": "The variance of X equals the expected value of X squared minus the square of the expected value of X."}
+{"text": "The normal distribution has probability density one over sigma square root 2 pi times e to the negative x minus mu squared over 2 sigma squared."}
+{"text": "L'Hopital's rule: if the limit of f over g produces 0 over 0 or infinity over infinity, then the limit equals the limit of f prime over g prime."}
+{"text": "Taylor series: a smooth function f can be written as the sum of f prime n at a times x minus a to the n over n factorial."}
+{"text": "The Maclaurin series for e to the x is the sum from n equals 0 to infinity of x to the n divided by n factorial."}
+{"text": "The sine function has Maclaurin series x minus x cubed over 3 factorial plus x to the fifth over 5 factorial minus and so on."}
+{"text": "Partial fractions: x over the quantity x minus 1 times x plus 2 equals A over x minus 1 plus B over x plus 2. Solving gives A equals one third and B equals two thirds."}
+{"text": "The ratio test for series convergence: if the limit of the absolute value of a n plus 1 over a n is less than 1, the series converges absolutely."}
+{"text": "Integration by parts: the integral of u dv equals u v minus the integral of v du."}
+{"text": "The volume of a sphere with radius r is four thirds pi r cubed. The surface area is 4 pi r squared."}
+{"text": "By the mean value theorem, there exists a point c in the open interval a to b where f prime of c equals f of b minus f of a all divided by b minus a."}
+{"text": "Cauchy-Schwarz inequality: the absolute value of the dot product of u and v is at most the product of their magnitudes."}
+{"text": "The number e is irrational and transcendental, approximately equal to 2.71828182845. It is the base of the natural logarithm."}
+{"text": "Pi is irrational and transcendental, approximately 3.14159265358. The ratio of any circle's circumference to its diameter."}
+{"text": "The golden ratio phi equals one plus root five divided by two, approximately 1.61803. It satisfies phi squared equals phi plus one."}
+{"text": "By the intermediate value theorem, if f is continuous on the closed interval a to b and k is between f of a and f of b, then there exists c in that interval with f of c equal to k."}
+{"text": "The rank of a matrix plus the nullity equals the number of columns. This is the rank-nullity theorem."}
+{"text": "Stokes' theorem relates the surface integral of the curl of a vector field to the line integral of the field over the boundary of the surface."}
+{"text": "The divergence theorem relates the volume integral of the divergence of a vector field to the surface integral over the enclosing boundary."}
+{"text": "A function is bijective if it is both injective (one-to-one) and surjective (onto). Bijections have well-defined inverses."}
+{"text": "The number of ways to choose k items from n without repetition and without regard to order is n factorial divided by k factorial times n minus k factorial."}
+{"text": "The pigeonhole principle: if n plus 1 items are placed in n containers, at least one container holds two or more items."}
+{"text": "Modular arithmetic: 17 modulo 5 equals 2 because 17 equals 3 times 5 plus 2."}
+{"text": "The sum of the interior angles of a polygon with n sides is n minus 2 times 180 degrees."}
+{"text": "Complex conjugates: the product of a complex number a plus bi and its conjugate a minus bi equals a squared plus b squared, which is real."}

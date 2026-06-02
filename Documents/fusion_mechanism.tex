@@ -1,0 +1,289 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+\usepackage{amssymb}
+\usepackage[T1]{fontenc}
+
+\title{Cognitive Fusion Mechanism: Integration of LLM, Neurons, and Memory}
+\author{Witold Warcho\l{}}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+
+The fusion mechanism projects three independent information streams
+into a shared 64 dimensional space: the LLM embedding query, neuron
+state and topology, and episodic memory entries. The design prioritizes
+information preservation and prevents any single stream from drowning
+out the others through deterministic, non-learnable feature extraction
+followed by banded assembly and light context-modulated mixing.
+
+\section{Input Streams}
+
+\subsection{LLM Query Stream}
+
+The LLM provides a dense embedding vector:
+\begin{equation}
+\mathbf{q}_{\text{raw}} \in \mathbb{R}^{d_{\text{llm}}}
+\end{equation}
+
+where $d_{\text{llm}}$ is the model's embedding dimension (variable).
+This stream represents the current model query or context.
+
+\subsection{Neuron Stream}
+
+Active neurons are flattened into a feature vector:
+\begin{equation}
+\mathbf{n}_{\text{flat}} = 
+[\text{state}_0, \text{output}_0, \text{conn}_0, \text{layer}_0, \ldots,
+ c_{0,0}, \ldots, c_{0,5}, w_{0,0}, \ldots, w_{0,5},
+ \text{state}_1, \ldots]^T
+\end{equation}
+
+Each of $N \leq 8$ neurons contributes 4 scalar fields plus 12 connection
+indices and weights (6 connections, each with an index and weight):
+\begin{equation}
+\mathbf{n}_{\text{flat}} \in \mathbb{R}^{\text{NEURON\_STRIDE} \times N}
+\end{equation}
+
+where $\text{NEURON\_STRIDE} = 4 + 2 \times 6 = 16$ per neuron. This
+captures local graph topology and synaptic weights, not just scalar
+activations.
+
+\subsection{Memory Stream}
+
+Episodic memory entries consist of a rich vector and an importance weight:
+\begin{equation}
+\mathbf{m}_i = (\mathbf{v}_i, \alpha_i, \tau_i)
+\quad \text{where} \quad
+\mathbf{v}_i \in \mathbb{R}^{2N + d_{\text{input}} = 22}
+\end{equation}
+
+Up to $M = 300$ entries may be stored. The vector combines prior neuron
+state (implicit history) and external input features.
+
+\section{Projection Mechanism}
+
+\subsection{Deterministic Random Projection}
+
+Rather than learned weights, projections use a seeded pseudo-random
+matrix fixed across runs. A projection coefficient is computed as:
+
+\begin{equation}
+P(r, c) = \frac{\text{bits}(h(r, c)) \& 0xffffff}{2^{23}} - 1.0
+\end{equation}
+
+where $h(r, c)$ applies splitmix64-style mixing:
+\begin{align}
+z &= (r \ll 32) \oplus (c \cdot 2654435761 + 1) \\
+z &\leftarrow z + 0x9e3779b97f4a7c15 \\
+z &\leftarrow (z \oplus (z \gg 30)) \times 0xbf58476d1ce4e5b9 \\
+z &\leftarrow (z \oplus (z \gg 27)) \times 0x94d049bb133111eb \\
+z &\leftarrow z \oplus (z \gg 31)
+\end{align}
+
+This ensures:
+\begin{itemize}
+\item Every input dimension feeds every output dimension (dense mixing)
+\item No information is dropped via blocking or striding
+\item The matrix is reproducible without storage
+\item Variance is well-distributed across output dimensions
+\end{itemize}
+
+\subsection{Full Projection}
+
+An $n$-dimensional source is projected into the 64 dimensional space:
+\begin{equation}
+\text{proj}(\mathbf{x})_i = \frac{1}{\sqrt{n}} \sum_{j=0}^{n-1}
+x_j \cdot P(i, j)
+\quad \forall i \in [0, 64)
+\end{equation}
+
+The $\frac{1}{\sqrt{n}}$ scaling follows Johnson-Lindenstrauss and
+stabilizes variance regardless of source dimension.
+
+\subsection{Banded Projection}
+
+A source is projected into a contiguous band $[o, o + \ell)$ of the
+output while leaving other positions untouched:
+\begin{equation}
+\text{proj\_band}(\mathbf{x}, o, \ell, \text{seed})_i =
+\begin{cases}
+\frac{1}{\sqrt{n}} \sum_{j=0}^{n-1} x_j \cdot P(i + \text{seed}, j)
+&\text{if } i \in [o, o+\ell) \\
+0 &\text{otherwise}
+\end{cases}
+\end{equation}
+
+Each band uses a different seed (1009, 2003, 3001) so bands occupy
+distinct subspaces and do not share a projection.
+
+\section{Processing Pipeline}
+
+\subsection{Stage 1: LLM Query with Text Integration}
+
+The LLM embedding is projected and normalized:
+\begin{equation}
+\mathbf{q} = \text{LayerNorm}(\text{proj}(\mathbf{q}_{\text{raw}}))
+\end{equation}
+
+If an input sentence embedding is provided, it is projected separately,
+normalized, and blended at 0.5 strength:
+\begin{equation}
+\mathbf{q} \leftarrow \text{LayerNorm}(\mathbf{q} + 
+0.5 \cdot \text{LayerNorm}(\text{proj}(\mathbf{t}_{\text{raw}})))
+\end{equation}
+
+This allows the input sentence to directly influence the query band
+without being gated away by memory blending.
+
+\subsection{Stage 2: Neuron Feature Extraction}
+
+Neurons are flattened and projected:
+\begin{equation}
+\mathbf{n} = \text{LayerNorm}(\text{proj}(\mathbf{n}_{\text{flat}}))
+\end{equation}
+
+\subsection{Stage 3: Top-K Memory Attention}
+
+Memory entries are scored by dot-product similarity to the query,
+and only the top-$K$ entries are used. This prevents softmax collapse
+to uniform weights when entry importances are similar.
+
+\subsubsection{Blending Prior and Memory}
+
+Each entry is weighted-blended with a default system prior:
+\begin{equation}
+\mathbf{w}_i = (1 - \beta) \mathbf{d} + \beta \mathbf{v}_i
+\quad \text{scaled by} \quad
+\tilde{\mathbf{w}}_i = \alpha_i \cdot \mathbf{w}_i
+\end{equation}
+
+where $\beta = \text{mem\_weight\_ratio} \in [0, 1]$ controls the blend
+($\beta = 0$ uses pure default, $\beta = 1$ uses pure stored memory).
+
+\subsubsection{Key Projection and Scoring}
+
+Each blended vector is projected and scored:
+\begin{equation}
+\mathbf{k}_i = \text{LayerNorm}(\text{proj}(\tilde{\mathbf{w}}_i))
+\quad,\quad
+s_i = \frac{1}{\sqrt{64}} \langle \mathbf{q}, \mathbf{k}_i \rangle
+\end{equation}
+
+\subsubsection{Top-K Selection}
+
+The top $K = \min(M, 8)$ entries are selected by score. Their scores
+are normalized via softmax:
+\begin{equation}
+\pi_i = \text{softmax}(s_i) = \frac{\exp(s_i - \max_j s_j)}
+{\sum_j \exp(s_j - \max_j s_j)}
+\end{equation}
+
+\subsubsection{Memory Vector Aggregation}
+
+The memory contribution is the weighted sum:
+\begin{equation}
+\mathbf{m} = \text{LayerNorm}\left(\sum_{i \in \text{top-K}}
+\pi_i \mathbf{k}_i \right)
+\end{equation}
+
+\subsection{Stage 4: Banded Assembly}
+
+Each stream is re-projected into its own contiguous band:
+\begin{align}
+\text{fused}[0:22] &= \text{proj\_band}(\mathbf{q}, 0, 22, 1009) \\
+\text{fused}[22:43] &= \text{proj\_band}(\mathbf{n}, 22, 21, 2003) \\
+\text{fused}[43:64] &= \text{proj\_band}(\mathbf{m}, 43, 21, 3001)
+\end{align}
+
+where BAND\_Q = 22, BAND\_N = 21, BAND\_M = 21 such that
+$22 + 21 + 21 = 64$.
+
+\textbf{Key property:} Each stream owns a disjoint set of dimensions.
+No gating mechanism controls how much of each stream appears; instead,
+the downstream fusion transformer learns to weight the bands as needed.
+
+\subsection{Stage 5: Context-Modulated Cross-Band Mixing}
+
+A light mixing term is applied based on context:
+\begin{equation}
+\gamma = \text{sigmoid}(2 \cdot \text{context\_factor} - 1) \times 0.5
+\end{equation}
+
+For each dimension, a partner dimension is mixed in:
+\begin{equation}
+\text{cross}[i] = \text{fused}[i] + \gamma \cdot 
+\text{fused}[(i + 32) \bmod 64]
+\end{equation}
+
+This introduces low-amplitude interactions between bands without
+allowing dominance of any stream.
+
+\subsection{Stage 6: Output Normalization}
+
+The final vector is layer-normalized:
+\begin{equation}
+\mathbf{out} = \text{LayerNorm}(\text{cross})
+\end{equation}
+
+\section{Layer Normalization}
+
+Layer normalization standardizes a vector to zero mean and unit variance:
+\begin{align}
+\mu &= \frac{1}{n} \sum_{i=0}^{n-1} v_i \\
+\sigma^2 &= \frac{1}{n} \sum_{i=0}^{n-1} (v_i - \mu)^2 \\
+\text{LayerNorm}(\mathbf{v})_i &= \frac{v_i - \mu}{\sqrt{\sigma^2 + \epsilon}}
+\end{align}
+
+where $\epsilon = 10^{-6}$ prevents division by zero.
+
+\section{Design Rationale}
+
+\subsection{Why Deterministic Projection?}
+
+The C implementation is a deterministic feature extractor, not a learner.
+Since gradients are killed at the ctypes boundary, learnable mixing must
+occur in the downstream Python fusion transformer. The C side's role is
+to produce a rich, stable, non-degenerate feature vector.
+
+\subsection{Why Banded Architecture?}
+
+The original design used sigmoid gating to blend streams. This allowed
+neuron and memory state to bury the LLM query at coefficients near 0.5.
+By carving the output into three disjoint bands, each stream is
+guaranteed representation. The transformer downstream can then learn
+to weight each band appropriately.
+
+\subsection{Why Top-K Memory Attention?}
+
+Attending over all $M$ memory entries with similar importances causes
+softmax to collapse to uniform weights, reducing the memory vector to
+noise averaging. Top-K selection ensures the attention distribution is
+peaked and informative.
+
+\subsection{Why Project Bands Separately?}
+
+Each band uses a different seed in the pseudo-random projection.
+This ensures the three streams occupy distinct subspaces and their
+projected features do not interfere.
+
+\section{Output Characteristics}
+
+\begin{itemize}
+\item \textbf{Dimension:} 64 (fixed)
+\item \textbf{Bands:} Query (dims 0--21), Neuron (dims 22--42),
+Memory (dims 43--63)
+\item \textbf{Normalization:} Layer-normalized, mean 0, variance 1
+\item \textbf{Mixing:} Light cross-band mixing at $\leq 0.5$ strength,
+controlled by context
+\item \textbf{Information:} All three input streams present in balanced
+proportion
+\end{itemize}
+
+\end{document}

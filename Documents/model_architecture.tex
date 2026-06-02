@@ -1,0 +1,567 @@
+\documentclass[12pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[T1]{fontenc}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{geometry}
+\usepackage{graphicx}
+\geometry{margin=1in}
+
+\title{Larkos Training Loop and Inference Runner}
+\author{Witold Warcho\l{}}
+\date{\today}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{red},
+  breaklines=true,
+  captionpos=b
+}
+
+\begin{document}
+
+\maketitle
+
+\section{Overview}
+
+The Larkos system consists of two major components:
+
+\begin{enumerate}
+  \item \textbf{TrainingLoop}: Full differentiable training with gradient
+    computation, emotional state updates, and cognitive fusion
+  \item \textbf{LarkosRunner}: Inference-only forward pass that loads
+    trained weights and runs without gradient accumulation
+\end{enumerate}
+
+Both components share the same core modules: the LarkosModel,
+\_FusionTransformerHead, embedding networks, and text codec. The key
+difference is that TrainingLoop computes gradients and updates weights,
+while LarkosRunner only performs forward inference using frozen weights.
+
+\section{Core Mathematical Components}
+
+\subsection{Fourier Encoding}
+
+The input $x \in \mathbb{R}^D$ is encoded using positional-style Fourier
+features:
+
+\[
+  \phi(x) = \left[ \sin(2^0 \pi x), \sin(2^1 \pi x), \ldots,
+    \sin(2^{E-1} \pi x), \cos(2^0 \pi x), \cos(2^1 \pi x), \ldots,
+    \cos(2^{E-1} \pi x) \right]
+\]
+
+where $E$ is the number of encodings ($\texttt{FOURIER\_ENCODINGS}$). The
+output has dimension $2 \cdot D \cdot E$.
+
+\textbf{Rationale}: Fourier encodings help the model learn periodic and
+frequency-dependent patterns. They provide stable gradients compared to
+raw inputs and help with generalization.
+
+\subsection{Online Normalization}
+
+Two normalization strategies track running statistics:
+
+\subsubsection{OnlineMinMax}
+
+Per-dimension running min/max via exponential moving average (EMA):
+
+\[
+  m_t^{(i)} = m_{t-1}^{(i)} + \alpha (x_t^{(i)} - m_{t-1}^{(i)})
+\]
+
+where $\alpha = 0.02$ (momentum). The normalized output is:
+
+\[
+  \tilde{x}^{(i)} = \frac{x^{(i)} - m}{M - m + \epsilon} \cdot 2 - 1
+\]
+
+clamped to $[-3, 3]$.
+
+\textbf{Rationale}: EMA-based min/max prevents early outliers from
+permanently warping the normalization range. The system gradually forgets
+extreme values and re-centers around the actual distribution.
+
+\subsubsection{OnlineMeanStd}
+
+Per-dimension running mean and variance via EMA:
+
+\[
+  \mu_t^{(i)} = \mu_{t-1}^{(i)} + \alpha (x_t^{(i)} - \mu_{t-1}^{(i)})
+\]
+
+\[
+  \sigma_t^{(i)} = (1 - \alpha) \left( \sigma_{t-1}^{(i)} +
+    \alpha (x_t^{(i)} - \mu_{t-1}^{(i)})^2 \right)
+\]
+
+Output normalization:
+
+\[
+  \hat{x}^{(i)} = \frac{x^{(i)} - \mu}{\sqrt{\sigma} + \epsilon_f}
+\]
+
+where $\epsilon_f = 0.1$ (std floor).
+
+\textbf{Rationale}: The std floor prevents near-constant dimensions from
+dividing by zero and blowing up. It keeps low-variance dimensions genuinely
+quiet rather than amplified by numerical instability.
+
+\subsection{Temporal Context Window}
+
+The Fourier-encoded input is padded into a temporal window of size
+$\texttt{TEMPORAL\_WINDOW}$:
+
+\[
+  x_{\text{temporal}} = \text{concat}(x_{t-w+1}, x_{t-w+2}, \ldots, x_t)
+\]
+
+where $w = \texttt{TEMPORAL\_WINDOW}$. Earlier positions are zero-padded.
+
+\textbf{Rationale}: Temporal history provides context for the model to
+detect trends and patterns over time, improving predictions.
+
+\section{Training Loop Architecture}
+
+\subsection{Forward Pass}
+
+The forward pass (\texttt{\_forward}) builds a fully differentiable
+computation graph:
+
+\[
+  \text{model\_pred} = \text{LarkosModel}(x_{\text{temporal}},
+    \text{embed\_ctx})
+\]
+
+The LarkosModel outputs a vector that is split into an LLM embedding
+($\text{llm\_embed}$) and auxiliary dimensions.
+
+\subsubsection{Cross-Attention Path}
+
+The LLM embedding is gated and fused with text context:
+
+\[
+  \text{embed\_gate} = \text{EmbedWeightNet}(x_{\text{norm}})
+\]
+
+\[
+  \text{llm\_embed\_g} = \text{llm\_embed} \odot \text{embed\_gate}
+\]
+
+\[
+  \text{llm\_embed\_ca} = \text{InputCrossAttention}(x_{\text{norm}},
+    \text{llm\_embed\_g})
+\]
+
+where $\odot$ denotes element-wise multiplication.
+
+\textbf{Why Cross-Attention}: Instead of concatenating the input and
+embedding, cross-attention treats the $D$-dimensional input as $D$ separate
+1-D query tokens and the $E$-dimensional embedding as key/value. This is
+far more expressive than simple concatenation and allows learned
+interaction.
+
+\subsubsection{Cognitive Fusion}
+
+The cross-attention embedding is detached (breaking the gradient graph at
+the C boundary) and passed to cognitive fusion:
+
+\[
+  \text{fused\_cog\_raw} = \text{cognitive\_fuse}(\text{llm\_embed\_ca},
+    \text{neurons}, \text{mem\_state}, \text{default\_weights}, \ldots)
+\]
+
+\textbf{Graph Breaking}: The detach at the C boundary is intentional. The
+C-side fusion depends on backend neurons and memory state which are
+non-differentiable objects. The Python side cannot backprop into them. An
+auxiliary loss on the cross-attention embedding (\texttt{aux\_proj})
+provides the gradient signal for the modules before the C boundary.
+
+\subsubsection{Frozen Input Windows}
+
+Training targets are refreshed every $\texttt{TARGET\_FREEZE\_INTERVAL}$
+epochs. Between refreshes, both the cached target and cached fused
+cognitive vector are held constant:
+
+\[
+  \text{frozen\_input} = \text{(cache exists)} \land
+    \text{(epoch} - \text{target\_epoch)} < \text{INTERVAL}
+\]
+
+\textbf{Rationale}: If the target is fixed but the transformer input
+drifts, the model chases a moving input toward a fixed point, producing
+unstable loss. Pinning both together and refreshing them synchronously
+prevents this pathology. The frozen window allows the model to converge
+on the pair without the input changing underneath it.
+
+\subsection{Fusion Transformer Head}
+
+The \_FusionTransformerHead treats the fused cognitive vector as three
+contiguous bands that form a 3-token sequence:
+
+\[
+  \text{Band 0} = \text{fused}[0:\text{BAND\_Q}] \quad (\text{LLM query
+    stream})
+\]
+
+\[
+  \text{Band 1} = \text{fused}[\text{BAND\_Q}:\text{BAND\_Q+BAND\_N}]
+    \quad (\text{neuron stream})
+\]
+
+\[
+  \text{Band 2} = \text{fused}[\text{BAND\_Q+BAND\_N}:]
+    \quad (\text{memory stream})
+\]
+
+Each band is projected into a shared $d_{\text{model}}$ space:
+
+\[
+  \text{tok}_i = \text{proj}_i(\text{Band}_i) + \text{stream\_embed}_{i}
+\]
+
+A transformer encoder runs self-attention over the 3 tokens:
+
+\[
+  \text{enc} = \text{TransformerEncoder}([\text{tok}_{0}, \text{tok}_{1},
+    \text{tok}_{2}])
+\]
+
+Output is mean-pooled and projected to neuron dimensions:
+
+\[
+  \text{fused} = \text{LinearOut}\left(
+    \frac{1}{3} \sum_{i} \text{enc}_{i} \right)
+\]
+
+\textbf{Why Three Bands}: The bands carry different semantic information
+(LLM query, neuron state, memory). Using separate projections and stream
+embeddings lets each stream learn its own mapping and lets attention
+determine their balance.
+
+\textbf{Mean Pooling}: Pooling instead of taking a single token keeps all
+three streams in the output. Attention learns to weight each stream
+appropriately rather than collapsing to one.
+
+\subsection{Loss Computation}
+
+The loss is a weighted blend of four components:
+
+\[
+  L_{\text{total}} = \lambda_1 L_{\text{outer}} + \lambda_2 L_{\text{base}}
+    + \lambda_3 L_{\text{pred}} + \lambda_4 L_{\text{aux}}
+\]
+
+where:
+
+\[
+  L_{\text{outer}} = \text{SmoothL1}(\text{maml\_pred}, \text{target})
+\]
+
+\[
+  L_{\text{base}} = \text{SmoothL1}(\text{fused}, \text{target})
+\]
+
+\[
+  L_{\text{pred}} = \text{SmoothL1}(\text{model\_pred}, \text{target})
+\]
+
+\[
+  L_{\text{aux}} = \text{SmoothL1}(\text{aux\_proj}(\text{llm\_embed\_ca}),
+    \text{target})
+\]
+
+The weights are:
+
+\[
+  \lambda_1 = \text{mc\_blend}
+\]
+
+\[
+  \lambda_2 = (1 - \text{mc\_blend}) \cdot 0.4
+\]
+
+\[
+  \lambda_3 = (1 - \text{mc\_blend}) \cdot 0.3
+\]
+
+\[
+  \lambda_4 = 0.2
+\]
+
+where $\text{mc\_blend} \in [0.1, 0.5]$ is derived from Monte Carlo
+variance:
+
+\[
+  \text{mc\_blend} = \max(0.5 - \sigma^2_{\text{MC}} \cdot 0.5, 0.1)
+\]
+
+\textbf{Adaptive Blending}: High MC variance (model uncertainty)
+increases the weight on the outer (MAML) loss, which is more stable. Low
+variance decreases it. The system adapts loss weights based on model
+confidence.
+
+\textbf{SmoothL1 Loss}: Uses $\beta = 0.1$, giving $L_2$ near zero and
+$L_1$ far from zero. This prevents saturation unlike Cosine+L1 which
+fought itself.
+
+\textbf{Auxiliary Loss}: The aux path carries gradient signal to
+cross-attention, embed-weight-net, and text-proj, which sit before the
+non-differentiable C boundary.
+
+\subsection{Gradient Balancing}
+
+The embed\_weight\_net branch is often weak. Balancing rescales weak
+gradients:
+
+\[
+  \text{scale} = \min\left( \frac{\text{norm}_{\text{FT}}}{10 \cdot
+    \text{norm}_{\text{embed}}}, 5 \right)
+\]
+
+where norms are EMA-smoothed to avoid per-epoch pulses.
+
+\[
+  p.\text{grad} \leftarrow p.\text{grad} \cdot \text{scale}
+\]
+
+All gradients are then clipped globally:
+
+\[
+  \|g\|_2 \leq 1.0
+\]
+
+\textbf{Rationale}: Prevents any single module from exploding and ensures
+balanced learning across branches.
+
+\subsection{Monte Carlo Sampling}
+
+During forward, the model runs in training mode and takes $T$ stochastic
+samples to estimate output variance:
+
+\[
+  \text{samples} = [\text{model}(x + \epsilon_1), \ldots,
+    \text{model}(x + \epsilon_T)]
+\]
+
+where $\epsilon_i \sim \mathcal{N}(0, 0.05^2) \cdot r_{\text{explore}}$
+if exploration is above threshold, else zeros (dropout only).
+
+\[
+  \sigma^2_{\text{MC}} = \text{Var}(\text{samples})
+\]
+
+\textbf{Rationale}: Uncertainty estimates inform loss weighting. Without
+dropout, variance collapses and weights become uniform. Gaussian noise at
+high exploration keeps estimates meaningful.
+
+\subsection{Frozen Skip Logic}
+
+On a frozen (input, target) window, once the loss falls below
+$\texttt{\_frozen\_skip\_floor}$ ($\approx 0.15$), the optimizer step
+is skipped:
+
+\[
+  \text{skip} = \text{(in\_frozen\_window)} \land
+    (L_{\text{loss}} < 0.15)
+\]
+
+\textbf{Rationale}: Continuing to step a memorized pair drives gradients
+to $\sim 10^{-4}$ and wastes progress. Skipping prevents the sawtooth
+artifact in loss logs.
+
+\section{Emotional and Identity Updates}
+
+After each backward pass, side-effects update the C-side backend:
+
+\subsection{Novelty Derivation}
+
+From loss history:
+
+\[
+  \text{novelty} = \min\left(
+    \frac{|L_{\text{current}} - \bar{L}|}{\bar{L} + 10^{-8}}, 1.0
+  \right)
+\]
+
+where $\bar{L}$ is the mean of the loss history. This is blended with the
+backend's reflection:
+
+\[
+  \text{novelty} = \max(\text{novelty}, \text{reflect\_novelty},
+    \text{reflect\_drift})
+\]
+
+\subsection{Satisfaction and Emotion}
+
+Satisfaction combines low loss and improving loss:
+
+\[
+  \text{sat} = \min(\max(1.0 - L, 0) + \max(L_{\text{prev}} - L, 0), 1.0)
+\]
+
+Emotion type and strength are picked based on loss delta and novelty:
+
+\[
+  \text{type} = \begin{cases}
+    \text{SURPRISE} & \text{if } \text{novelty} > 0.7 \\
+    \text{LOVE} & \text{if } L_{\text{prev}} - L > 0.03 \\
+    \text{HATE} & \text{if } L - L_{\text{prev}} > 0.03 \\
+    \text{SURPRISE} & \text{otherwise (weak)}
+  \end{cases}
+\]
+
+\[
+  \text{strength} = \begin{cases}
+    \min(\text{novelty} \cdot 0.6, 0.6) & \text{type} = \text{SURPRISE} \\
+    \min(\Delta L \cdot 3.0, 0.6) & \text{type} = \text{LOVE/HATE} \\
+    0.1 & \text{deadband}
+  \end{cases}
+\]
+
+\textbf{Deadband}: The $0.03$ threshold prevents small wiggles from
+triggering extreme emotions. The $0.1$ deadband emotion keeps arousal
+decaying instead of being pinned high.
+
+\section{Inference: LarkosRunner}
+
+\subsection{Initialization and Loading}
+
+LarkosRunner reconstructs only forward-path modules and loads trained
+weights via \texttt{load\_checkpoint}:
+
+\[
+  \text{Runner} = \text{LarkosRunner}(\text{backend}, \text{ckpt\_path})
+\]
+
+The C-side backend is reloaded with saved memory and network states:
+
+\[
+  \text{backend.load\_memory()}
+\]
+
+\[
+  \text{backend.load\_network\_states()}
+\]
+
+\textbf{Rationale}: Without the trained backend state, cognitive\_fuse
+would see empty neurons and memory, and the readout would not reflect
+training dynamics. Both halves (PyTorch weights + C-side state) are needed
+together; neither is usable alone.
+
+\subsection{Forward Inference}
+
+The runner's \texttt{step} method mirrors \texttt{TrainingLoop.\_forward}
+but without:
+
+\begin{itemize}
+  \item MC probes (no uncertainty sampling; frozen dropout)
+  \item MAML inner loop (single forward pass only)
+  \item Auxiliary loss computation (output path only)
+\end{itemize}
+
+All computation runs with \texttt{@torch.no\_grad()}, preventing gradient
+accumulation and saving memory.
+
+\subsection{Input and Frozen Window Handling}
+
+Since inference has no training schedule, the frozen-window logic is
+disabled:
+
+\[
+  \text{frozen\_input} = \text{False}
+\]
+
+The fused cognitive vector is always fresh (from the live backend) and
+re-normalized:
+
+\[
+  \text{fused\_cog} = \text{normalize}(\text{cognitive\_fuse}(\ldots))
+\]
+
+This mirrors the behavior of a target-refresh epoch in training.
+
+\subsection{Output}
+
+The runner returns a dictionary with:
+
+\begin{itemize}
+  \item \texttt{fused}: The final neuron prediction (NumPy array)
+  \item \texttt{model\_pred}: Raw LarkosModel output
+  \item \texttt{text\_input}: The driver sentence
+  \item \texttt{text\_output}: Decoded text from the fused vector
+\end{itemize}
+
+\section{Key Design Decisions}
+
+\subsection{Why Detach at the C Boundary}
+
+The C-side cognitive fusion reads non-differentiable backend objects
+(neurons, memory, network history). Python cannot build a computation
+graph through C code. Detaching prevents error and forces the gradient
+signal through the auxiliary loss instead.
+
+\subsection{Why Frozen Input Windows}
+
+Updating the target every epoch while the transformer input drifts (due to
+neuron and memory changes) causes the loss to thrash. Pinning both on the
+same refresh schedule prevents chasing a moving target.
+
+\subsection{Why Separate Projections for Bands}
+
+Each band carries different information (LLM embedding, neuron state,
+memory). Shared projections would force all streams through the same
+learned mapping. Separate projections (and stream embeddings) allow each
+stream to learn its own representation and let attention decide balance.
+
+\subsection{Why SmoothL1 Loss}
+
+SmoothL1 with $\beta = 0.1$ avoids saturation of cosine losses and the
+fighting behavior of Cosine+L1. It is stable and well-behaved for
+vector regression.
+
+\subsection{Why Auxiliary Loss}
+
+The cross-attention, embed-weight-net, and text-proj networks sit before
+the C boundary. Without a separate loss on their outputs, they would
+receive zero gradient (the path to target is broken). The auxiliary loss
+regresses the cross-attention embedding to the target dimension and
+provides the needed signal.
+
+\section{Scheduler and Optimization}
+
+Training uses:
+
+\begin{itemize}
+  \item Optimizer: Adam with $\text{lr} = \text{BASE\_LR}$,
+    $\text{weight\_decay} = 10^{-4}$, $\text{eps} = 10^{-6}$
+  \item Scheduler: CosineAnnealingLR with
+    $T_{\max} = \text{COSINE\_T\_MAX}$,
+    $\eta_{\min} = 10^{-5}$
+  \item EMA: Exponential moving average of main model weights (used for
+    validation and inference)
+\end{itemize}
+
+The scheduler steps after each backward pass, ensuring a smooth cosine
+decay over the epoch range.
+
+\section{Conclusion}
+
+The Larkos training loop and runner form a unified system:
+
+\begin{itemize}
+  \item \textbf{Training}: Full differentiable forward pass,
+    multi-component loss, frozen windows, emotional state management
+  \item \textbf{Inference}: Fast forward-only pass, loaded weights and
+    backend state, no gradient overhead
+\end{itemize}
+
+Both share core modules and math but are optimized for their respective
+tasks. The design prioritizes stability (frozen windows, gradient
+balancing, adaptive loss weights), interpretability (emotional and
+identity updates), and efficiency (EMA, frozen sampling).
+
+\end{document}
