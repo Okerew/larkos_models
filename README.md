@@ -30,7 +30,7 @@ Then just run the main.py file normally `python main.py`
 | `modules/backend/` | Reflection, identity, memory, motivation, imagination, decision paths |
 | `modules/fusion_mechanism/` | C extension for neural fusion |
 | `neural_web.c` / `immitrin_functions.c` | C backend, neural web + SIMD functions |
-| `include/` | C headers (`definitions.h`, `nw.h`, etc.) |
+| `include/` | C headers (`definitions.h`, etc.) |
 | `Documents/` | Architecture & design docs |
 | `Documents/model_architecture.tex/pdf` | Full architecture paper (LaTeX) |
 | `Documents/fusion_mechanism.tex/pdf` | Fusion mechanism paper (LaTeX) |
