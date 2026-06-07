@@ -145,8 +145,11 @@ def bind(lib: CDLL):
 
 
 def serialize_level(entries_ptr, size: int) -> list:
+    if not entries_ptr:
+        return []
     out = []
-    for i in range(size):
+    safe_size = min(size, MEMORY_CAPACITY)
+    for i in range(safe_size):
         e = entries_ptr[i]
         out.append({
             "importance": float(e.importance),
@@ -160,12 +163,17 @@ def serialize_level(entries_ptr, size: int) -> list:
 
 
 def serialize_state(mem_sys) -> dict:
+    if not mem_sys:
+        return {"size": 0, "capacity": 0,
+                "short_term": {"size": 0, "capacity": 0, "entries": []},
+                "medium_term": {"size": 0, "capacity": 0, "entries": []},
+                "long_term": {"size": 0, "capacity": 0, "entries": []}}
     ms = mem_sys.contents
 
     def _level(level):
         size = int(level.size)
         cap  = int(level.capacity)
-        n = max(0, min(size, cap))
+        n = max(0, min(size, cap, MEMORY_CAPACITY * 2))
         return {
             "size":     size,
             "capacity": cap,

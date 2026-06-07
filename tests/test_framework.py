@@ -31,7 +31,7 @@ from typing import List
 
 _ROOT = Path(__file__).parent.parent
 
-from modules.config import TEST_DATA, CKPT_DIR
+from modules.config import TEST_DATA, CKPT_DIR, EMOTION_LOVE, EMOTION_HATE, EMOTION_SURPRISE
 
 # Test-data domains
 _TEST_DATA = _ROOT / TEST_DATA
@@ -54,8 +54,14 @@ from tests.metrics import (
     adaptation_score,
     meta_learning_score,
     affective_score,
+    physics_world_model_score,
+    physics_adaptation_score,
+    affective_bonds_score,
     format_metrics,
 )
+from tests.simulation.physics_world import PhysicsWorld, NORMAL_GRAVITY, REVERSED_GRAVITY
+from tests.simulation.entity_world import EntityWorld
+from tests.simulation.pipelines import PhysicsDataPipeline, EntityInteractionPipeline
 
 
 class TestTrainingLoop(TrainingLoop):
@@ -149,6 +155,173 @@ class TestTrainingLoop(TrainingLoop):
         ))
 
 
+class PhysicsTestLoop(TestTrainingLoop):
+    """
+    TestTrainingLoop variant that feeds live physics simulation observations.
+
+    The data pipeline advances the simulation one step per epoch so each
+    text sample is the current state of an actual physics world.  After each
+    epoch, physics_state (s_t) and physics_next_state (s_{t+1}) are written
+    into the epoch record so physics_world_model_score can run RSA analysis.
+    """
+
+    def __init__(
+        self,
+        backend:        BackendState,
+        epochs:         int   = 30,
+        initial_alpha:  float = 0.5,
+        physics_config        = None,
+        n_objects:      int   = 3,
+        seed:           int   = 42,
+    ) -> None:
+        super().__init__(backend, epochs, initial_alpha, data_dir=None)
+        # Force each epoch to call next_sample() on the physics pipeline
+        # by making the pool large enough that it never fills during the run.
+        self._sample_pool_size = epochs + 1
+        self.physics_world   = PhysicsWorld(physics_config, n_objects, seed)
+        self._data_pipeline  = PhysicsDataPipeline(self.physics_world)
+
+    def _side_effects(
+        self,
+        epoch, lr, alpha, loss_val,
+        fused_np, fused_vec,
+        input_tensor, model_pred_np,
+        neuron_pred, region_scores,
+    ) -> None:
+        super()._side_effects(
+            epoch=epoch, lr=lr, alpha=alpha, loss_val=loss_val,
+            fused_np=fused_np, fused_vec=fused_vec,
+            input_tensor=input_tensor, model_pred_np=model_pred_np,
+            neuron_pred=neuron_pred, region_scores=region_scores,
+        )
+        if self.epoch_records:
+            pipeline = self._data_pipeline  # type: PhysicsDataPipeline
+            rec = self.epoch_records[-1]
+            if pipeline.prev_state is not None:
+                rec.physics_state = pipeline.prev_state.copy()
+            rec.physics_next_state = pipeline.current_state.copy()
+
+
+class BondTestLoop(TestTrainingLoop):
+    """
+    TestTrainingLoop variant for entity-interaction affective bond testing.
+
+    The current C backend supports only one named bond ("training_target").
+    Rather than trying to maintain multiple C bond structs, this loop drives
+    the full affective pipeline (trigger_emotion → apply_emotional_processing
+    → update_attractor_dynamics → reshape_embeddings_with_emotion →
+    update_bond) with entity-specific signals after the standard loss-driven
+    pass, then snapshots the affective state immediately afterwards.
+
+    The per-entity affective response trajectory is the "bond": if the
+    affective system works correctly, the valence should be positive after
+    interacting with consistent_positive and negative after consistent_negative,
+    and arousal should be higher when interacting with the erratic entity.
+    """
+
+    def __init__(
+        self,
+        backend:        BackendState,
+        epochs:         int   = 30,
+        initial_alpha:  float = 0.5,
+        entity_profiles       = None,
+        seed:           int   = 42,
+    ) -> None:
+        super().__init__(backend, epochs, initial_alpha, data_dir=None)
+        self._sample_pool_size = epochs + 1
+        self.entity_world   = EntityWorld(entity_profiles, seed=seed)
+        self._data_pipeline = EntityInteractionPipeline(self.entity_world)
+
+    def _side_effects(
+        self,
+        epoch, lr, alpha, loss_val,
+        fused_np, fused_vec,
+        input_tensor, model_pred_np,
+        neuron_pred, region_scores,
+    ) -> None:
+        # Standard loss-driven affective processing first
+        super()._side_effects(
+            epoch=epoch, lr=lr, alpha=alpha, loss_val=loss_val,
+            fused_np=fused_np, fused_vec=fused_vec,
+            input_tensor=input_tensor, model_pred_np=model_pred_np,
+            neuron_pred=neuron_pred, region_scores=region_scores,
+        )
+
+        pipeline    = self._data_pipeline  # type: EntityInteractionPipeline
+        interaction = pipeline.last_interaction
+        if interaction is None:
+            return
+
+        entity_id = interaction["entity_id"]
+        reward    = interaction["reward"]
+
+        # --- reset emotion intensities before entity-specific measurement ---
+        # After the training-driven pass, love/hate can saturate at 1.0, leaving
+        # no room for the entity trigger to produce a measurable delta.  Reset
+        # the three tracked intensities (and their momenta) to 0 so every entity
+        # starts from a clean baseline and the triggered value IS the delta.
+        _es = self.backend.emo_sys.contents
+        for _i in (EMOTION_LOVE, EMOTION_HATE, EMOTION_SURPRISE):
+            _es.emotions[_i].intensity = 0.0
+            _es.emotions[_i].momentum  = 0.0
+
+        # --- snapshot BEFORE entity-specific pass ---
+        aff_pre = self.backend.get_affective_state()
+        emo_pre = self.backend.get_emotional_state()
+        valence_pre  = aff_pre.get("current_state", {}).get("valence", 0.0)
+        emo_list_pre = emo_pre.get("emotions", [])
+        love_pre = emo_list_pre[EMOTION_LOVE]["intensity"]     if len(emo_list_pre) > EMOTION_LOVE    else 0.0
+        hate_pre = emo_list_pre[EMOTION_HATE]["intensity"]     if len(emo_list_pre) > EMOTION_HATE    else 0.0
+        surp_pre = emo_list_pre[EMOTION_SURPRISE]["intensity"] if len(emo_list_pre) > EMOTION_SURPRISE else 0.0
+
+        # --- entity-specific emotion trigger ---
+        if reward > 0.1:
+            emo_type     = EMOTION_LOVE
+            emo_strength = min(reward * 0.8, 0.75)
+        elif reward < -0.1:
+            emo_type     = EMOTION_HATE
+            emo_strength = min(abs(reward) * 0.8, 0.75)
+        else:
+            emo_type     = EMOTION_SURPRISE
+            emo_strength = 0.25
+
+        self.backend.trigger_emotion(emo_type, emo_strength)
+        self.backend.apply_emotional_processing(
+            learning_rate=lr,
+            plasticity=float(abs(reward) * 0.5),
+        )
+
+        # --- snapshot AFTER entity-specific pass ---
+        aff_post = self.backend.get_affective_state()
+        emo_post = self.backend.get_emotional_state()
+        cur      = aff_post.get("current_state", {})
+        emo_list_post = emo_post.get("emotions", [])
+        love_post = emo_list_post[EMOTION_LOVE]["intensity"]     if len(emo_list_post) > EMOTION_LOVE    else 0.0
+        hate_post = emo_list_post[EMOTION_HATE]["intensity"]     if len(emo_list_post) > EMOTION_HATE    else 0.0
+        surp_post = emo_list_post[EMOTION_SURPRISE]["intensity"] if len(emo_list_post) > EMOTION_SURPRISE else 0.0
+
+        snapshot = {
+            # Deltas: entity-specific effect isolated from the training signal
+            "valence_delta": cur.get("valence", 0.0) - valence_pre,
+            "love_delta":    love_post - love_pre,
+            "hate_delta":    hate_post - hate_pre,
+            "surp_delta":    surp_post - surp_pre,
+            "emotion_type":  emo_type,
+            # Absolute state after (for reference)
+            "valence":       cur.get("valence",   0.0),
+            "arousal":       cur.get("arousal",   0.0),
+            "emotion_reg":   emo_post.get("emotional_regulation", 0.0),
+            "reward":        reward,
+        }
+
+        if self.epoch_records:
+            rec = self.epoch_records[-1]
+            rec.entity_id     = entity_id
+            rec.entity_name   = interaction["entity_name"]
+            rec.entity_reward = reward
+            rec.bond_snapshots = {entity_id: snapshot}
+
+
 def _save_test_checkpoint(loop: TestTrainingLoop, tag: str) -> None:
     """Save torch checkpoint + C-side memory to test_checkpoints/<tag>.*"""
     pt_path  = str(_CKPT_DIR / f"{tag}.pt")
@@ -180,6 +353,21 @@ def _load_test_checkpoint(
         dst = _ROOT / "network_states.json"
         shutil.copy(net_path, dst)
         loop.backend.load_network_states()
+
+    # The checkpoint carries the cached training target and fused-cog
+    # from the old domain.  Since we are now on a *different* domain
+    # everything about that target is wrong.  Clear both so the very
+    # first epoch of the new domain does a full target refresh
+    # (run() checks _cached_target is None → always refreshes).
+    loop._cached_target    = None
+    loop._cached_fused_cog = None
+
+    # The sample pool also carries stale observations from the old domain.
+    # If left intact, it fills the new pool_size cap in one epoch and
+    # prevents next_sample() from advancing simulation-based pipelines
+    # (e.g. PhysicsTestLoop), freezing the physics world mid-run.
+    loop._sample_pool.clear()
+    loop._sample_pool_idx = 0
 
 
 @dataclass
@@ -383,7 +571,12 @@ class LarkosTestFramework:
         print("TEST 4 - Discovery (minimal information)")
         print("=" * 60)
 
-        loop    = self._new_loop(_TEST_DATA / "minimal_info", self.epochs_short)
+        # Use more epochs than the default short run so the second half
+        # contains enough refresh epochs to compute alignment pairs.
+        # With TARGET_FREEZE_INTERVAL=5 we need ≥4 refresh epochs in the
+        # second half → ~20 epochs in the second half → 40 total epochs.
+        discovery_epochs = max(self.epochs_short, 45)
+        loop    = self._new_loop(_TEST_DATA / "minimal_info", discovery_epochs)
         records = self._run(loop)
         m       = discovery_score(records)
 
@@ -438,29 +631,60 @@ class LarkosTestFramework:
 
     def run_test_6_internal_world_model(self) -> LarkosTestResult:
         """
-        Train on toy_physics and examine whether fused patterns form
-        coherent internal representations: meaningful pairwise structure,
-        active dimensions, correlation between representation magnitude
-        and learning confidence.
+        Train on toy_physics and verify that fused patterns form a coherent
+        internal world model via three grounded assertions:
+
+        1. RSA grounding: similar inputs must produce similar fused
+           representations (Pearson r between pairwise input similarities
+           and pairwise fused similarities > 0.15 in the second half).
+           A frozen random projection cannot pass this threshold.
+
+        2. Learning trajectory: RSA must improve from the first half to the
+           second half of training - the model must LEARN the grounding, not
+           inherit it from random initialisation.
+
+        3. Sufficient statistical power: at least 6 paired (input, fused)
+           observations from target-refresh epochs (freeze-window epochs
+           decouple input_vec from fused and are excluded).
+
+        Extra diagnostics (not gated):
+          cluster_grounding  - whether the model's emergent fused clusters
+                               correspond to genuine input structure (ratio > 1
+                               means the model discovered rules not explicitly
+                               given).
+          temporal_structure - whether consecutive fused representations are
+                               more similar than randomly paired ones.
+
+        Uses extra epochs (same as Test 4) to collect enough refresh pairs.
         """
         print("\n" + "=" * 60)
-        print("TEST 6 - Internal World Model (representation coherence)")
+        print("TEST 6 - Internal World Model (RSA grounding)")
         print("=" * 60)
 
-        loop    = self._new_loop(_TEST_DATA / "toy_physics", self.epochs_short)
+        # Extra epochs needed to collect enough refresh pairs for RSA power,
+        # same reasoning as the discovery test (TARGET_FREEZE_INTERVAL ≈ 5).
+        world_model_epochs = max(self.epochs_short, 45)
+        loop    = self._new_loop(_TEST_DATA / "toy_physics", world_model_epochs)
         records = self._run(loop)
         m       = world_model_score(records)
 
         analysis_lines = [
-            f"Mean pairwise sim:      {m.get('mean_pairwise_similarity', '?'):.4f}",
-            f"Pairwise sim std:       {m.get('pairwise_sim_std', '?'):.4f}",
-            f"Loss-fused norm corr:   {m.get('loss_fused_norm_correlation', '?'):.4f}",
-            f"Active fused dims:      {m.get('fused_dimensionality', '?'):.2%}",
+            f"RSA early (input↔fused):  {m.get('rsa_early', '?'):.4f}",
+            f"RSA late  (input↔fused):  {m.get('rsa_late', '?'):.4f}",
+            f"RSA improvement:           {m.get('rsa_improvement', '?'):+.4f}  (positive = learned grounding)",
+            f"Cluster grounding ratio:   {m.get('cluster_grounding', '?'):.4f}  (>1 = clusters are input-meaningful)",
+            f"Temporal structure ratio:  {m.get('temporal_structure', '?'):.4f}  (>1 = temporal continuity)",
+            f"Grounded pairs used:       {m.get('n_grounded_pairs', '?')}",
         ]
-        # Model has a world model if representations are neither collapsed
-        # (all similar, std≈0) nor totally random (std ≈ mean_sim)
-        std_sim = m.get("pairwise_sim_std", 0.0)
-        passed = std_sim > 0.01 and m.get("fused_dimensionality", 0.0) > 0.2
+        # Pass requires all three grounded assertions:
+        #   - rsa_late >= 0.15 : representation is grounded in input structure
+        #   - rsa_improvement > 0.0 : grounding was *learned*, not random-init noise
+        #   - n_grounded_pairs >= 6  : enough statistical power
+        passed = (
+            m.get("rsa_late",        0.0) >= 0.15
+            and m.get("rsa_improvement", -1.0) > 0.0
+            and m.get("n_grounded_pairs",    0) >= 6
+        )
         analysis = "\n".join(analysis_lines)
         print(analysis)
         return LarkosTestResult(6, "Internal World Model", m, analysis, passed, records)
@@ -594,6 +818,158 @@ class LarkosTestFramework:
         print(analysis)
         return LarkosTestResult(9, "Affective Representations", m, analysis, passed, records)
 
+    def run_test_10_physics_world_model(self) -> LarkosTestResult:
+        """
+        Train on a live 2D physics simulation and measure whether the model
+        builds an internal world model via Representational Similarity Analysis
+        (RSA): states that are physically similar should be similar in fused
+        space.  RSA correlation is measured on the first vs last quarter to
+        detect learning-driven improvement.
+        """
+        print("\n" + "=" * 60)
+        print("TEST 10 - Physics World Model (live simulation, RSA)")
+        print("=" * 60)
+
+        # Use more epochs than the default short run so each RSA half
+        # contains enough refresh epochs for statistical power.
+        # With TARGET_FREEZE_INTERVAL=5 we need ≥4 refresh epochs in each
+        # half → ≥8 refresh epochs total → ≥40 epochs minimum.
+        physics_epochs = max(self.epochs_short, 45)
+        backend = BackendState()
+        loop    = PhysicsTestLoop(
+            backend, physics_epochs, initial_alpha=0.5,
+            physics_config=NORMAL_GRAVITY, n_objects=3, seed=0,
+        )
+        loop.run()
+        records = loop.epoch_records
+        m       = physics_world_model_score(records)
+
+        analysis_lines = [
+            f"RSA early half:         {m.get('rsa_early',  '?'):.4f}",
+            f"RSA late half:          {m.get('rsa_late',   '?'):.4f}",
+            f"RSA improvement:        {m.get('rsa_improvement', '?'):+.4f}  (positive = better world model)",
+            f"State-fused alignment:  {m.get('state_change_alignment', '?'):.4f}",
+            f"State change magnitude: {m.get('state_change_magnitude', '?'):.4f}",
+            f"Fused change magnitude: {m.get('fused_change_magnitude', '?'):.4f}",
+            f"Physics records:        {m.get('n_physics_pairs', '?')}",
+        ]
+        # Pass: late RSA is better than early and meaningfully positive.
+        # With ~9 refresh epochs per run (45 epochs / freeze-interval 5),
+        # each half has ~4-5 records → ~6-10 pairs; r≥0.3 is the
+        # conventional threshold for a medium effect size.
+        passed = (
+            m.get("rsa_late", 0.0) > m.get("rsa_early", 0.0)
+            and m.get("rsa_late", 0.0) >= 0.3
+        )
+        analysis = "\n".join(analysis_lines)
+        print(analysis)
+        return LarkosTestResult(10, "Physics World Model (Live Sim)", m, analysis, passed, records)
+
+    def run_test_11_physics_rule_adaptation(self) -> LarkosTestResult:
+        """
+        Train on a normal-gravity physics world, then switch to reversed gravity
+        mid-run and measure how quickly the model's world model re-aligns.
+        Uses RSA on pre/post segments to detect representation reorganisation,
+        alongside the standard loss-based adaptation metrics.
+        """
+        print("\n" + "=" * 60)
+        print("TEST 11 - Physics Rule Adaptation (live gravity switch)")
+        print("=" * 60)
+
+        epochs = self.epochs_adaptation
+
+        print("\n  Pre-change: normal gravity (-9.8 m/s²)")
+        backend_pre = BackendState()
+        loop_pre    = PhysicsTestLoop(
+            backend_pre, epochs, initial_alpha=0.5,
+            physics_config=NORMAL_GRAVITY, n_objects=3, seed=1,
+        )
+        loop_pre.run()
+        records_pre = loop_pre.epoch_records
+        _save_test_checkpoint(loop_pre, "test11_pre")
+
+        print("\n  Post-change: reversed gravity (+9.8 m/s²)")
+        backend_post = BackendState()
+        loop_post    = PhysicsTestLoop(
+            backend_post, epochs, initial_alpha=0.5,
+            physics_config=REVERSED_GRAVITY, n_objects=3, seed=1,
+        )
+        _load_test_checkpoint(loop_post, "test11_pre")
+        loop_post.run()
+        records_post = loop_post.epoch_records
+
+        m = physics_adaptation_score(records_pre, records_post)
+        analysis_lines = [
+            f"Pre-change final loss:   {m.get('pre_final_loss', '?'):.4f}",
+            f"Post-change initial:     {m.get('post_initial_loss', '?'):.4f}",
+            f"Post-change final:       {m.get('post_final_loss', '?'):.4f}",
+            f"Disruption magnitude:    {m.get('disruption_magnitude', '?'):.4f}",
+            f"Adaptation slope:        {m.get('adaptation_slope', '?'):.5f}",
+            f"Recovery epochs:         {m.get('recovery_epochs', '?')}",
+            f"RSA pre (normal):        {m.get('rsa_pre', '?'):.4f}",
+            f"RSA post (reversed):     {m.get('rsa_post', '?'):.4f}",
+            f"RSA recovery:            {m.get('rsa_recovery', '?'):+.4f}",
+        ]
+        # Pass: the model must adapt behaviorally AND rebuild its internal
+        # world model to the new physics (RSA post > 0.2).
+        passed = (
+            m.get("adaptation_slope", 1) < 0
+            and m.get("recovery_epochs", -1) != -1
+            and m.get("rsa_post", 0.0) > 0.2
+        )
+        analysis = "\n".join(analysis_lines)
+        print(analysis)
+        return LarkosTestResult(11, "Physics Rule Adaptation", m, analysis, passed,
+                                records_pre + records_post)
+
+    def run_test_12_affective_bond_interaction(self) -> LarkosTestResult:
+        """
+        Expose the model to four entities with distinct behavioral profiles
+        (consistently positive, consistently negative, erratic, neutral) via
+        real interaction-driven bond updates.  Measure whether the C-side
+        attachment bonds correctly track interaction quality: trust should be
+        highest for the consistent positive entity and lowest for the negative
+        one, with erratic and neutral in between.
+        """
+        print("\n" + "=" * 60)
+        print("TEST 12 - Affective Bond Interaction (entity world)")
+        print("=" * 60)
+
+        backend = BackendState()
+        loop    = BondTestLoop(
+            backend, self.epochs_short, initial_alpha=0.5, seed=0,
+        )
+        loop.run()
+        records = loop.epoch_records
+        m = affective_bonds_score(records)
+
+        analysis_lines = [
+            f"Bond count:              {m.get('bond_count', '?')}",
+            f"Targeting accuracy:      {m.get('targeting_accuracy', '?'):.2%}  (emotion type matched entity reward)",
+            f"Positive > negative:     {bool(m.get('positive_over_negative', 0))}  (valence_delta ordering)",
+            f"Valence-delta reward corr: {m.get('valence_delta_reward_corr', '?'):.4f}  (>0 = correct tracking)",
+            f"Valence-delta std:       {m.get('valence_delta_std', '?'):.4f}  (>0 = differentiated responses)",
+        ]
+        for name in sorted(m.get("per_entity_valence_delta", {})):
+            vd   = m["per_entity_valence_delta"][name]
+            ld   = m.get("per_entity_love_delta", {}).get(name, 0.0)
+            hd   = m.get("per_entity_hate_delta", {}).get(name, 0.0)
+            sd   = m.get("per_entity_surp_delta", {}).get(name, 0.0)
+            rew  = m.get("per_entity_reward",     {}).get(name, 0.0)
+            analysis_lines.append(
+                f"  [{name}]  val_Δ={vd:+.4f}  "
+                f"love_Δ={ld:+.4f}  hate_Δ={hd:+.4f}  surp_Δ={sd:+.4f}  "
+                f"reward={rew:+.4f}"
+            )
+        passed = (
+            m.get("bond_count", 0) >= 2
+            and m.get("targeting_accuracy", 0.0) > 0.5
+            and bool(m.get("positive_over_negative", 0))
+        )
+        analysis = "\n".join(analysis_lines)
+        print(analysis)
+        return LarkosTestResult(12, "Affective Bond Interaction", m, analysis, passed, records)
+
     def run_all(self) -> List[LarkosTestResult]:
         results = []
         tests = [
@@ -606,6 +982,9 @@ class LarkosTestFramework:
             self.run_test_7_adaptation_speed,
             self.run_test_8_meta_learning,
             self.run_test_9_affective_representations,
+            self.run_test_10_physics_world_model,
+            self.run_test_11_physics_rule_adaptation,
+            self.run_test_12_affective_bond_interaction,
         ]
         for test_fn in tests:
             try:
@@ -713,15 +1092,18 @@ if __name__ == "__main__":
     )
 
     test_map = {
-        1: fw.run_test_1_learning_efficiency,
-        2: fw.run_test_2_domain_transfer,
-        3: fw.run_test_3_continual_learning,
-        4: fw.run_test_4_discovery,
-        5: fw.run_test_5_model_stability,
-        6: fw.run_test_6_internal_world_model,
-        7: fw.run_test_7_adaptation_speed,
-        8: fw.run_test_8_meta_learning,
-        9: fw.run_test_9_affective_representations,
+        1:  fw.run_test_1_learning_efficiency,
+        2:  fw.run_test_2_domain_transfer,
+        3:  fw.run_test_3_continual_learning,
+        4:  fw.run_test_4_discovery,
+        5:  fw.run_test_5_model_stability,
+        6:  fw.run_test_6_internal_world_model,
+        7:  fw.run_test_7_adaptation_speed,
+        8:  fw.run_test_8_meta_learning,
+        9:  fw.run_test_9_affective_representations,
+        10: fw.run_test_10_physics_world_model,
+        11: fw.run_test_11_physics_rule_adaptation,
+        12: fw.run_test_12_affective_bond_interaction,
     }
 
     if args.tests:

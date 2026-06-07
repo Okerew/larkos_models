@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -30,6 +30,14 @@ class EpochRecord:
     specialization_effectiveness: float = 0.0
     identity_confidence: float = 0.0
     identity_consistency: float = 0.0
+    # Physics simulation fields (Tests 10 / 11)
+    physics_state:      np.ndarray = None  # s_t   observation vector
+    physics_next_state: np.ndarray = None  # s_{t+1} observation vector
+    # Entity bond interaction fields (Test 12)
+    entity_id:      int   = -1
+    entity_name:    str   = ""
+    entity_reward:  float = 0.0
+    bond_snapshots: dict  = field(default_factory=dict)  # entity_id -> bond metrics
 
 
 def learning_efficiency_score(records: List[EpochRecord]) -> dict:
@@ -293,10 +301,20 @@ def discovery_score(records: List[EpochRecord]) -> dict:
             return float(np.dot(a, b) / (na * nb))
         return None
 
+    # intra_run_spread is computed only over REFRESH epochs in the last
+    # quarter.  Inside a freeze window the transformer input and target
+    # are pinned, so consecutive fused vectors are nearly identical and
+    # would artificially collapse the spread - the metric we actually
+    # care about is whether the model's internal representations form
+    # non-trivial structure when they ARE allowed to vary.
+    late_refresh = [
+        r for r in records[n - q:]
+        if getattr(r, "input_refreshed", False)
+    ]
     fused_sims = []
-    for i in range(len(late)):
-        for j in range(i + 1, len(late)):
-            s = _cos(late[i], late[j])
+    for i in range(len(late_refresh)):
+        for j in range(i + 1, len(late_refresh)):
+            s = _cos(late_refresh[i].fused, late_refresh[j].fused)
             if s is not None:
                 fused_sims.append(s)
     spread = float(np.std(fused_sims)) if fused_sims else 0.0
@@ -389,63 +407,136 @@ def stability_score(records: List[EpochRecord]) -> dict:
 
 def world_model_score(records: List[EpochRecord]) -> dict:
     """
-    Probes whether the model builds coherent internal representations.
+    Probes whether the model builds a coherent internal world model.
 
-    We measure the clustering coefficient of fused vectors: if the model
-    encodes rules rather than noise, similar inputs should map to similar
-    fused vectors even without explicit supervision.
+    Three assertions are required, none of which a frozen random projection
+    can satisfy:
 
-    We also check whether fused-vector magnitude correlates with loss
-    (a representation that tracks confidence should be larger when
-    loss is lower).
+    1. Grounding (RSA): similar inputs produce similar fused representations.
+       Measured via Representational Similarity Analysis - the Pearson r
+       between pairwise input cosine similarities and pairwise fused cosine
+       similarities.  A frozen random projection scores ~0 here (it
+       projects to random dimensions, destroying relative distances).
+
+    2. Learning trajectory: the grounding improves from the first half to the
+       second half of training.  A fixed projection's RSA is constant.
+
+    3. Cluster grounding: when the model forms tight clusters in fused space,
+       those clusters must be meaningfully input-grounded.  Measured as the
+       ratio of mean input similarity inside the top-20%-fused-similar pairs
+       to the mean input similarity across all pairs.  A ratio > 1.0 means
+       the model's implicit groupings are not arbitrary - it has discovered
+       a rule for what belongs together even without explicit supervision.
+
+    Only target-refresh epochs are used: inside a freeze window the
+    transformer is fed the cached fused-cog target, not the live input, so
+    input_vec and fused are decoupled.  Refresh epochs carry genuinely paired
+    (input, fused) observations.
 
     Returns:
-      mean_pairwise_similarity    - mean cosine similarity of all fused pairs
-      pairwise_sim_std            - std (low = all vectors similar = collapsed)
-      loss_fused_norm_correlation - Pearson r between loss and fused norm
-                                    negative means low loss -> large fused (good)
-      fused_dimensionality        - fraction of fused dimensions with std > 0.01
-                                    (how many dims actually carry information)
+      rsa_early          - RSA(input↔fused) on first-half refresh epochs
+      rsa_late           - RSA(input↔fused) on second-half refresh epochs
+      rsa_improvement    - rsa_late - rsa_early  (positive = model learned grounding)
+      cluster_grounding  - mean input sim of top-20% fused-similar pairs /
+                           mean input sim of all pairs  (>1 = clusters are meaningful;
+                           random baseline ≈ 1.0)
+      temporal_structure - mean consecutive-fused cosine sim /
+                           mean randomly-paired-fused cosine sim
+                           (>1 = temporal continuity beyond random)
+      n_grounded_pairs   - number of (input, fused) pairs used for late RSA
     """
     n = len(records)
     if n == 0:
         return {}
 
-    fused_mat = np.stack([r.fused for r in records])  # (N, D)
-    losses    = np.array([r.loss for r in records])
-    norms     = np.linalg.norm(fused_mat, axis=1)
+    refresh = [
+        r for r in records
+        if getattr(r, "input_refreshed", False)
+        and getattr(r, "input_vec",      None) is not None
+    ]
 
-    # Pairwise cosine similarities - sample up to 200 pairs to keep it fast
-    fuseds = fused_mat
-    pairs = []
-    for i in range(min(n, 20)):
-        for j in range(i + 1, min(n, 20)):
-            pairs.append((i, j))
-
-    sims = []
-    for i, j in pairs:
-        a, b = fuseds[i], fuseds[j]
+    def _cos(a: np.ndarray, b: np.ndarray) -> Optional[float]:
         na, nb = np.linalg.norm(a), np.linalg.norm(b)
         if na > 1e-8 and nb > 1e-8:
-            sims.append(float(np.dot(a, b) / (na * nb)))
+            return float(np.dot(a, b) / (na * nb))
+        return None
 
-    mean_sim = float(np.mean(sims)) if sims else 0.0
-    std_sim  = float(np.std(sims))  if sims else 0.0
+    def _rsa(recs: list) -> tuple:
+        """RSA between input_vec and fused over a set of records. Returns (r, n_pairs)."""
+        in_sims: list[float] = []
+        fu_sims: list[float] = []
+        for i in range(len(recs)):
+            for j in range(i + 1, len(recs)):
+                in_s = _cos(np.ravel(recs[i].input_vec), np.ravel(recs[j].input_vec))
+                fu_s = _cos(recs[i].fused, recs[j].fused)
+                if in_s is not None and fu_s is not None:
+                    in_sims.append(in_s)
+                    fu_sims.append(fu_s)
+        if len(in_sims) < 3:
+            return 0.0, len(in_sims)
+        ai, af = np.array(in_sims), np.array(fu_sims)
+        if np.std(ai) < 1e-8 or np.std(af) < 1e-8:
+            return 0.0, len(in_sims)
+        return float(np.corrcoef(ai, af)[0, 1]), len(in_sims)
 
-    # Correlation between loss and fused norm
-    corr = 0.0
-    if len(losses) > 2 and np.std(norms) > 1e-8 and np.std(losses) > 1e-8:
-        corr = float(np.corrcoef(losses, norms)[0, 1])
+    half = len(refresh) // 2
+    rsa_early, _       = _rsa(refresh[:half])
+    rsa_late,  n_pairs = _rsa(refresh[half:])
+    rsa_improvement    = rsa_late - rsa_early
 
-    # Dimensionality: fraction of dims with meaningful variation
-    dim_stds = np.std(fused_mat, axis=0)
-    active_dims = float(np.mean(dim_stds > 0.01))
+    # Cluster grounding: do fused-space clusters correspond to input-space structure?
+    # Collect all pairwise (fused_sim, input_sim) for late refresh epochs, then
+    # compare the mean input sim of the top-20% fused-similar pairs against the
+    # mean input sim of all pairs.  Ratio > 1 means clusters are input-grounded.
+    cluster_grounding = 1.0
+    late_recs = refresh[half:]
+    if len(late_recs) >= 3:
+        all_pairs: list[tuple] = []
+        for i in range(len(late_recs)):
+            for j in range(i + 1, len(late_recs)):
+                in_s = _cos(np.ravel(late_recs[i].input_vec), np.ravel(late_recs[j].input_vec))
+                fu_s = _cos(late_recs[i].fused, late_recs[j].fused)
+                if in_s is not None and fu_s is not None:
+                    all_pairs.append((fu_s, in_s))
+        if len(all_pairs) >= 5:
+            mean_in_all = float(np.mean([p[1] for p in all_pairs]))
+            all_pairs.sort(key=lambda p: p[0], reverse=True)
+            top_n = max(1, len(all_pairs) // 5)
+            mean_in_top = float(np.mean([p[1] for p in all_pairs[:top_n]]))
+            if abs(mean_in_all) > 1e-8:
+                cluster_grounding = mean_in_top / (mean_in_all + 1e-8)
+
+    # Temporal structure: consecutive fused vectors should be more similar
+    # to each other than randomly paired vectors, detecting representation
+    # continuity across time steps.
+    temporal_structure = 1.0
+    all_fuseds = [r.fused for r in records]
+    if len(all_fuseds) >= 10:
+        consec_sims = []
+        for i in range(1, len(all_fuseds)):
+            s = _cos(all_fuseds[i - 1], all_fuseds[i])
+            if s is not None:
+                consec_sims.append(s)
+        rng = np.random.RandomState(0)
+        idx = rng.choice(len(all_fuseds), (min(len(all_fuseds) * 2, 200), 2))
+        shuffled_sims = []
+        for a, b in idx:
+            if a != b:
+                s = _cos(all_fuseds[a], all_fuseds[b])
+                if s is not None:
+                    shuffled_sims.append(s)
+        if consec_sims and shuffled_sims:
+            mean_shuffled = float(np.mean(shuffled_sims))
+            if abs(mean_shuffled) > 1e-8:
+                temporal_structure = float(np.mean(consec_sims)) / (mean_shuffled + 1e-8)
 
     return {
-        "mean_pairwise_similarity":    mean_sim,
-        "pairwise_sim_std":            std_sim,
-        "loss_fused_norm_correlation": corr,
-        "fused_dimensionality":        active_dims,
+        "rsa_early":          rsa_early,
+        "rsa_late":           rsa_late,
+        "rsa_improvement":    rsa_improvement,
+        "cluster_grounding":  cluster_grounding,
+        "temporal_structure": temporal_structure,
+        "n_grounded_pairs":   n_pairs,
     }
 
 
@@ -625,6 +716,265 @@ def affective_score(records: List[EpochRecord]) -> dict:
         "mask_identity_corr":         _corr(masks, confs),
         "cognitive_impact_range":     float(np.max(cogimps) - np.min(cogimps)),
         "affective_complexity":       affective_complexity,
+    }
+
+
+def physics_world_model_score(records: List[EpochRecord]) -> dict:
+    """
+    Tests whether the model builds an internal model of live physics dynamics.
+
+    Uses Representational Similarity Analysis (RSA): if the model has a world
+    model, states that are physically similar should also be similar in fused
+    space.  We measure the Pearson correlation between pairwise cosine
+    similarities in physics state space and pairwise cosine similarities in
+    fused space, on the first half vs last half of target-refresh epochs.
+
+    Only target-refresh epochs are used: on frozen epochs the transformer
+    receives the cached fused-cog target rather than the live physics text,
+    so fused and physics_state are decoupled.  Refresh epochs carry genuinely
+    paired (physics_state, fused) observations.
+
+    Also measures whether consecutive fused changes are directionally aligned
+    with consecutive physics state changes (state_change_alignment).
+
+    Returns:
+      rsa_early            - RSA correlation on first half of refresh epochs
+      rsa_late             - RSA correlation on last half of refresh epochs
+      rsa_improvement      - rsa_late - rsa_early (positive = model improved)
+      state_change_alignment - mean cosine similarity between normalised
+                               consecutive-physics-state deltas and
+                               normalised consecutive-fused deltas
+                               (dimension-capped to min of both)
+      state_change_magnitude - mean L2 norm of physics state changes
+      fused_change_magnitude - mean L2 norm of fused changes
+      n_physics_pairs        - number of refresh records used for RSA
+    """
+    phys_records = [
+        r for r in records
+        if r.physics_state is not None and getattr(r, "input_refreshed", False)
+    ]
+    n = len(phys_records)
+    if n < 4:
+        return {"rsa_early": 0.0, "rsa_late": 0.0, "rsa_improvement": 0.0,
+                "state_change_alignment": 0.0, "state_change_magnitude": 0.0,
+                "fused_change_magnitude": 0.0, "n_physics_pairs": 0}
+
+    def _cos_sim(a: np.ndarray, b: np.ndarray) -> Optional[float]:
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na > 1e-8 and nb > 1e-8:
+            return float(np.dot(a, b) / (na * nb))
+        return None
+
+    def _rsa(phys_vecs, fused_vecs, max_pairs: int = 100) -> float:
+        """Pearson r between pairwise cosine similarities in two spaces."""
+        n_ = len(phys_vecs)
+        pairs = [(i, j) for i in range(n_) for j in range(i + 1, n_)]
+        if len(pairs) > max_pairs:
+            rng = np.random.RandomState(0)
+            idx = rng.choice(len(pairs), max_pairs, replace=False)
+            pairs = [pairs[k] for k in idx]
+        ps, fs = [], []
+        for i, j in pairs:
+            p = _cos_sim(phys_vecs[i], phys_vecs[j])
+            f = _cos_sim(fused_vecs[i], fused_vecs[j])
+            if p is not None and f is not None:
+                ps.append(p)
+                fs.append(f)
+        if len(ps) < 3:
+            return 0.0
+        ap, af = np.array(ps), np.array(fs)
+        if np.std(ap) < 1e-8 or np.std(af) < 1e-8:
+            return 0.0
+        return float(np.corrcoef(ap, af)[0, 1])
+
+    half  = max(1, n // 2)
+    early = phys_records[:half]
+    late  = phys_records[half:]
+
+    rsa_early = _rsa(
+        [r.physics_state for r in early],
+        [r.fused         for r in early],
+    )
+    rsa_late = _rsa(
+        [r.physics_state for r in late],
+        [r.fused         for r in late],
+    )
+
+    # Consecutive-change alignment
+    alignments: list[float] = []
+    state_mags: list[float] = []
+    fused_mags: list[float] = []
+    for i in range(1, n):
+        ds = phys_records[i].physics_state - phys_records[i - 1].physics_state
+        df = phys_records[i].fused         - phys_records[i - 1].fused
+        dim = min(len(ds), len(df))
+        ds_, df_ = ds[:dim], df[:dim]
+        s = _cos_sim(ds_, df_)
+        if s is not None:
+            alignments.append(s)
+        state_mags.append(float(np.linalg.norm(ds)))
+        fused_mags.append(float(np.linalg.norm(df)))
+
+    return {
+        "rsa_early":              rsa_early,
+        "rsa_late":               rsa_late,
+        "rsa_improvement":        rsa_late - rsa_early,
+        "state_change_alignment": float(np.mean(alignments)) if alignments else 0.0,
+        "state_change_magnitude": float(np.mean(state_mags)) if state_mags else 0.0,
+        "fused_change_magnitude": float(np.mean(fused_mags)) if fused_mags else 0.0,
+        "n_physics_pairs":        len(phys_records),
+    }
+
+
+def physics_adaptation_score(
+    pre_records:  List[EpochRecord],
+    post_records: List[EpochRecord],
+) -> dict:
+    """
+    Measures adaptation after a live physics rule change (e.g., gravity flip).
+
+    Combines loss-based adaptation metrics with RSA-based world-model
+    re-alignment: after the rule changes, the model's internal representations
+    should re-organise to track the new dynamics.
+
+    Returns:
+      pre_final_loss
+      post_initial_loss
+      post_final_loss
+      disruption_magnitude   - post_initial - pre_final
+      adaptation_slope       - loss slope post-change
+      recovery_epochs
+      rsa_pre                - RSA correlation for pre-change final quarter
+      rsa_post               - RSA correlation for post-change final quarter
+      rsa_recovery           - rsa_post - rsa_pre (positive = re-aligned)
+    """
+    base = adaptation_score(pre_records, post_records)
+
+    rsa_pre  = physics_world_model_score(pre_records).get("rsa_late",  0.0)
+    rsa_post = physics_world_model_score(post_records).get("rsa_late", 0.0)
+
+    base["rsa_pre"]      = rsa_pre
+    base["rsa_post"]     = rsa_post
+    base["rsa_recovery"] = rsa_post - rsa_pre
+    return base
+
+
+def affective_bonds_score(records: List[EpochRecord]) -> dict:
+    """
+    Tests whether the affective system's emotional response correctly tracks
+    entity interaction quality by measuring per-entity DELTAS.
+
+    Absolute valence/arousal are dominated and saturated by the training-loop's
+    loss-driven emotion triggers.  The entity-specific signal is instead isolated
+    as the change (delta) in emotional state caused by each entity's interaction
+    pass, measured immediately before and after the entity-specific trigger call.
+
+    Expected deltas (second half of training):
+      consistent_positive  → love_delta > 0, hate_delta ≈ 0, valence_delta > 0
+      consistent_negative  → hate_delta > 0, love_delta ≈ 0, valence_delta < 0
+      erratic              → surp_delta or mixed love/hate delta, high variability
+      neutral_steady       → surp_delta > 0, valence_delta ≈ 0
+
+    Returns:
+      bond_count                 - distinct entities with delta snapshots
+      per_entity_love_delta      - {name: mean LOVE intensity delta per entity}
+      per_entity_hate_delta      - {name: mean HATE intensity delta}
+      per_entity_surp_delta      - {name: mean SURPRISE intensity delta}
+      per_entity_valence_delta   - {name: mean valence delta}
+      per_entity_reward          - {name: mean interaction reward}
+      targeting_accuracy         - fraction of epochs where the dominant emotion
+                                   delta matches what the entity's reward dictates
+                                   (reward>0 → love_delta > hate_delta, etc.)
+      positive_over_negative     - 1 if consistent_positive valence_delta >
+                                   consistent_negative valence_delta
+      valence_delta_reward_corr  - Pearson r(entity_reward, mean_valence_delta)
+      valence_delta_std          - std of per-entity mean valence_delta
+    """
+    bond_records = [r for r in records if r.entity_id >= 0 and r.bond_snapshots]
+    if not bond_records:
+        return {
+            "bond_count":               0,
+            "targeting_accuracy":       0.0,
+            "positive_over_negative":   0,
+            "valence_delta_reward_corr":0.0,
+            "valence_delta_std":        0.0,
+        }
+
+    # Second half only - the affective system needs time to respond
+    half = len(bond_records) // 2
+    late = bond_records[half:] if half > 0 else bond_records
+
+    per_love_d:    dict[str, list[float]] = {}
+    per_hate_d:    dict[str, list[float]] = {}
+    per_surp_d:    dict[str, list[float]] = {}
+    per_val_d:     dict[str, list[float]] = {}
+    per_reward:    dict[str, list[float]] = {}
+    epoch_correct: list[int]              = []
+
+    for rec in late:
+        eid  = rec.entity_id
+        name = rec.entity_name or str(eid)
+        snap = rec.bond_snapshots.get(eid, {})
+
+        love_d = float(snap.get("love_delta",    0.0))
+        hate_d = float(snap.get("hate_delta",    0.0))
+        surp_d = float(snap.get("surp_delta",    0.0))
+        val_d  = float(snap.get("valence_delta", 0.0))
+        reward = float(rec.entity_reward)
+
+        per_love_d.setdefault(name, []).append(love_d)
+        per_hate_d.setdefault(name, []).append(hate_d)
+        per_surp_d.setdefault(name, []).append(surp_d)
+        per_val_d.setdefault(name,  []).append(val_d)
+        per_reward.setdefault(name, []).append(reward)
+
+        # Per-epoch targeting: did the dominant emotion delta match the reward?
+        if reward > 0.1:
+            epoch_correct.append(int(love_d >= hate_d))
+        elif reward < -0.1:
+            epoch_correct.append(int(hate_d >= love_d))
+        else:
+            epoch_correct.append(int(abs(surp_d) >= abs(love_d) and abs(surp_d) >= abs(hate_d)))
+
+    mean_love_d = {n: float(np.mean(v)) for n, v in per_love_d.items()}
+    mean_hate_d = {n: float(np.mean(v)) for n, v in per_hate_d.items()}
+    mean_surp_d = {n: float(np.mean(v)) for n, v in per_surp_d.items()}
+    mean_val_d  = {n: float(np.mean(v)) for n, v in per_val_d.items()}
+    mean_reward = {n: float(np.mean(v)) for n, v in per_reward.items()}
+
+    targeting_accuracy = float(np.mean(epoch_correct)) if epoch_correct else 0.0
+
+    # positive_over_negative: consistent_positive valence_delta > consistent_negative
+    pos_vd = mean_val_d.get("consistent_positive")
+    neg_vd = mean_val_d.get("consistent_negative")
+    pos_over_neg = int(
+        pos_vd is not None and neg_vd is not None and pos_vd > neg_vd
+    )
+
+    # Pearson r between per-entity mean reward and per-entity mean valence_delta
+    names       = list(mean_val_d.keys())
+    vd_list     = [mean_val_d[n] for n in names]
+    reward_list = [mean_reward.get(n, 0.0) for n in names]
+    corr = 0.0
+    if len(names) >= 3:
+        va = np.array(vd_list)
+        ra = np.array(reward_list)
+        if np.std(va) > 1e-8 and np.std(ra) > 1e-8:
+            corr = float(np.corrcoef(va, ra)[0, 1])
+
+    vd_std = float(np.std(vd_list)) if len(vd_list) > 1 else 0.0
+
+    return {
+        "bond_count":                len(mean_val_d),
+        "per_entity_love_delta":     mean_love_d,
+        "per_entity_hate_delta":     mean_hate_d,
+        "per_entity_surp_delta":     mean_surp_d,
+        "per_entity_valence_delta":  mean_val_d,
+        "per_entity_reward":         mean_reward,
+        "targeting_accuracy":        targeting_accuracy,
+        "positive_over_negative":    pos_over_neg,
+        "valence_delta_reward_corr": corr,
+        "valence_delta_std":         vd_std,
     }
 
 

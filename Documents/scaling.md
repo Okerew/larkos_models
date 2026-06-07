@@ -106,3 +106,6 @@ Example: D_MODEL 64→256 (4×), N_LAYERS 2→4 (2×):
 | `BAND_M` | 21 | 85 |
 
 (Sum of BAND_* must equal FUSION_DIM; adjust ±1 as needed.)
+
+You can also increase MEMORY_CAPACITY if you want a bigger memory system, this 
+generally is recommended.
