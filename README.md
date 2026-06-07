@@ -50,6 +50,11 @@ you can commit bug fixes, though generally speaking you shouldn't commit anythin
 
 The text in test_data was completely ai generated.
 
+I generally recommended training the model by first using the testing feature 
+then combining the test checkpoints and starting training from there.
+You could also try after that running training normally than doing inference saving
+outputs/inputs from inference and then again some like 3 training steps that would probably work good with the model.
+
 Cuda is recommended.
 
 The code is licensed under the Apache 2.0 License see [NOTICE](NOTICE) for relevant information.

@@ -59,6 +59,41 @@ monitor them to see if something more gets encoded in them—not just
 reward/loss, but whether deeper things emerge from the quite simple
 emotional and affective structure.
 
+## Test 10: Physics World Model
+
+We run a live 2D physics simulation under normal gravity and feed the
+model sequential observations as text—positions, velocities, masses.
+The question is whether the fused representations actually track the
+physical state: are states that are physically similar also similar in
+the model's internal space? We measure this with Representational
+Similarity Analysis between the physics state vectors and the fused
+outputs. If the model builds a genuine world model, the alignment
+should improve from early to late training and beat what a frozen
+random projection could achieve.
+
+## Test 11: Physics Rule Adaptation
+
+We train the model on a normal-gravity physics world, checkpoint it,
+then flip gravity upside down and continue training. The idea is to
+see whether the internal world model reorganises to match the new
+rules—measured both by loss recovery and by RSA re-alignment in fused
+space. Passing means the model not only adapts behaviourally (loss
+recovers) but also rebuilds its internal representation of physics to
+match the new dynamics.
+
+## Test 12: Affective Bond Interaction
+
+We expose the model to four entities with distinct personalities: one
+consistently positive, one consistently negative, one erratic, and one
+neutral-steady. Each epoch the model interacts with one of them and we
+measure the immediate emotional response (valence, love, hate,
+surprise deltas) isolated from the training signal. The test checks
+whether the affective system correctly tracks interaction quality—the
+positive entity should trigger more love than hate, the negative one
+more hate than love, and the erratic one should produce more surprise.
+If the bonds are working, the per-entity valence deltas should line up
+with the rewards each entity gives.
+
 ## Constraints
 
 Note that because the model isn't mainly a transformer model but more

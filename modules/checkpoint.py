@@ -189,10 +189,12 @@ def load_checkpoint(
     for t in ckpt["input_history"]:
         loop.input_history.append(t)
 
-    loop._sample_pool        = list(ckpt["sample_pool"])
-    loop._sample_pool_idx    = ckpt["sample_pool_idx"]
-    loop._current_text_input = ckpt["current_text_input"]
-    loop.text_encoding       = ckpt["text_encoding"].to(DEVICE)
+    # Don't restore the sample pool / text input from the old run -
+    # the user may have changed data_dir, and a stale pool of old-domain
+    # samples would prevent the new pipeline from ever being consulted.
+    # The caller must re-seed these from the new data pipeline.
+    loop._sample_pool.clear()
+    loop._sample_pool_idx = 0
 
     if use_ema:
         # apply_shadow loads the shadow dict onto model (and stashes a
