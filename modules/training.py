@@ -570,6 +570,24 @@ class _OnlineMeanStd:
         std  = self.var.to(x.device).sqrt().clamp(min=self._floor)
         return ((x - mean) / std).clamp(-3.0, 3.0)
 
+def _expand_copy(
+    new_param: torch.Tensor,
+    old_param: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Copy old_param into a clone of new_param, fitting as many elements
+    as possible along each dimension. If the new model is larger than
+    the old on a given dimension, the old values fill the leading slice
+    and the remainder keeps the random initialisation. If old is larger,
+    the excess is truncated.
+    """
+    result = new_param.clone()
+    idx = tuple(
+        slice(0, min(o, n))
+        for o, n in zip(old_param.shape, new_param.shape)
+    )
+    result[idx] = old_param[idx]
+    return result
 
 class TrainingLoop:
     """
@@ -1240,6 +1258,132 @@ class TrainingLoop:
         )
         print(f"backend ack : {result}")
 
+    def start_training_from(
+        self,
+        model_path: str,
+    ) -> dict:
+        """
+        Transfer weights from a smaller (or differently-sized) checkpoint
+        into the current model via partial parameter copying.
+
+        For every named parameter:
+        - Same shape     : copied exactly.
+        - New dim larger : old values fill the leading slice; the rest
+                          keeps the random initialisation.
+        - New dim smaller: old values are truncated to fit.
+        - Name absent    : parameter keeps its random initialisation.
+
+        online_norm and fused_cog_norm are restored only when their
+        shapes match (attempted via try/except so mismatches are safe).
+        text_num_to_prefix is transferred when shapes allow.
+        EMA shadow receives the same partial copy.
+
+        Memory binaries (.bin) are NOT transferred here because the
+        C-side binary format is tied to MEMORY_VECTOR_SIZE. If the
+        architecture changed (e.g. MAX_NEURONS grew) the old binary
+        has a different record size and loading it corrupts the heap.
+        Use resume_memory_from only when resuming the exact same
+        architecture.
+        """
+        ckpt = torch.load(
+            model_path, map_location=DEVICE, weights_only=False
+        )
+
+        transferred = 0
+        skipped     = 0
+
+        named_modules = {
+            "model":              self.model,
+            "fusion_transformer": self.fusion_transformer,
+            "embed_weight_net":   self.embed_weight_net,
+            "cross_attn":         self.cross_attn,
+            "text_proj":          self.text_proj,
+        }
+
+        for key, module in named_modules.items():
+            if key not in ckpt:
+                continue
+            old_sd  = ckpt[key]
+            new_sd  = module.state_dict()
+            merged  = {}
+            for pname, new_val in new_sd.items():
+                if pname not in old_sd:
+                    merged[pname] = new_val
+                    skipped += 1
+                    continue
+                old_val = old_sd[pname].to(DEVICE)
+                if old_val.shape == new_val.shape:
+                    merged[pname] = old_val
+                    transferred += 1
+                else:
+                    try:
+                        merged[pname] = _expand_copy(new_val, old_val)
+                        transferred += 1
+                    except Exception:
+                        merged[pname] = new_val
+                        skipped += 1
+            module.load_state_dict(merged)
+
+        if "text_num_to_prefix" in ckpt:
+            old_sd  = ckpt["text_num_to_prefix"]
+            new_sd  = self.text_codec._num_to_prefix.state_dict()
+            merged  = {}
+            for pname, new_val in new_sd.items():
+                if pname not in old_sd:
+                    merged[pname] = new_val
+                    skipped += 1
+                    continue
+                old_val = old_sd[pname].to(DEVICE)
+                if old_val.shape == new_val.shape:
+                    merged[pname] = old_val
+                    transferred += 1
+                else:
+                    try:
+                        merged[pname] = _expand_copy(new_val, old_val)
+                        transferred += 1
+                    except Exception:
+                        merged[pname] = new_val
+                        skipped += 1
+            self.text_codec._num_to_prefix.load_state_dict(merged)
+
+        if "ema_shadow" in ckpt:
+            old_shadow = ckpt["ema_shadow"]
+            for k, new_v in self.ema.shadow.items():
+                if k not in old_shadow:
+                    continue
+                old_v = old_shadow[k].to(DEVICE)
+                if old_v.shape == new_v.shape:
+                    self.ema.shadow[k] = old_v
+                else:
+                    try:
+                        self.ema.shadow[k] = _expand_copy(new_v, old_v)
+                    except Exception:
+                        pass
+
+        if "online_norm" in ckpt:
+            try:
+                saved = ckpt["online_norm"]
+                if saved["min"].shape == self.online_norm.min.shape:
+                    from modules.checkpoint import _load_online_minmax
+                    _load_online_minmax(self.online_norm, saved)
+            except Exception:
+                pass
+
+        if "fused_cog_norm" in ckpt:
+            try:
+                saved = ckpt["fused_cog_norm"]
+                if saved["mean"].shape == self.fused_cog_norm.mean.shape:
+                    from modules.checkpoint import _load_online_meanstd
+                    _load_online_meanstd(self.fused_cog_norm, saved)
+            except Exception:
+                pass
+
+        print(
+            f"  start_training_from : transferred={transferred} "
+            f"skipped={skipped}"
+        )
+        return {"transferred": transferred, "skipped": skipped}
+
     def run(self) -> None:
         # Seed the optimizer LR once from the first meta read so
         # derive_lr()'s initial value is respected, then the scheduler
@@ -1599,8 +1743,17 @@ def training_loop(
     resume_from: str | None = None,
     resume_use_ema: bool = False,
     resume_memory_from: str | None = None,
+    start_from: str | None = None,
 ) -> None:
-    TrainingLoop(
+    """
+    resume_from : load a same-architecture checkpoint to continue training.
+    start_from  : load a differently-sized checkpoint via partial weight
+                  transfer (use when architecture changed, e.g. upscaling
+                  from pre_model.pt). Memory binaries cannot be transferred
+                  across architecture changes; use resume_memory_from only
+                  when the architecture is identical.
+    """
+    loop = TrainingLoop(
         backend,
         epochs,
         initial_alpha=alpha,
@@ -1608,4 +1761,7 @@ def training_loop(
         resume_from=resume_from,
         resume_use_ema=resume_use_ema,
         resume_memory_from=resume_memory_from,
-    ).run()
+    )
+    if start_from is not None:
+        loop.start_training_from(start_from)
+    loop.run()

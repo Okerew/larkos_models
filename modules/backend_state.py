@@ -300,12 +300,6 @@ class BackendState:
     # --- remote-like methods ---
 
     def receive_predictions(self, epoch, neuron_pred, fused):
-        self.add_memory_step(list(self.input_tensor_np))
-        scores = [float(v) for v in (
-            fused if hasattr(fused, "__iter__") else [fused] * self.NUM_REGIONS
-        )]
-        scores = (scores * self.NUM_REGIONS)[:self.NUM_REGIONS]
-        self.update_meta(scores)
         return {"status": "ok", "epoch": epoch}
 
     def add_memory_step(self, new_input: list[float] | None = None):
@@ -441,12 +435,17 @@ class BackendState:
         return {"status": "ok", "op": "process_neurons"}
 
     def run_reflection(self):
+        # history contains _history_count populated entries (0 .. _history_count-1).
+        # C helpers index into history[step-1] so step must never exceed
+        # _history_count. _step_counter grows unboundedly across epochs while
+        # _history_count caps at MAX_HISTORY, so we pass the smaller value.
+        safe_step = min(self._step_counter, self._history_count)
         metrics = self.lib.performSelfReflection(
             cast(self.neurons, c_void_p),
             self.mem_sys,
             self.state_history,
             self.reflect_hist,
-            c_int(self._step_counter),
+            c_int(safe_step),
         )
         return reflection.serialize_metrics(metrics)
 
@@ -750,13 +749,15 @@ class BackendState:
             return {"status": "skipped", "reason": "no scenarios"}
 
         from modules.backend.memory import MemoryEntry
-        best_idx   = 0
+        best_idx   = -1
         best_score = -1.0
         for i in range(n):
             sc    = sys.scenarios[i]
             nout  = max(0, min(
                 sc.num_outcomes, imagination.MAX_OUTCOMES_PER_SCENARIO
             ))
+            if nout == 0:
+                continue
             score = max(
                 (
                     sc.outcomes[j].plausibility
@@ -769,7 +770,15 @@ class BackendState:
                 best_score = score
                 best_idx   = i
 
+        if best_idx < 0:
+            return {"status": "skipped", "reason": "no scenarios with outcomes"}
+
         best_sc  = sys.scenarios[best_idx]
+        nout     = max(0, min(
+            best_sc.num_outcomes, imagination.MAX_OUTCOMES_PER_SCENARIO
+        ))
+        if nout == 0:
+            return {"status": "skipped", "reason": "selected scenario has no outcomes"}
         entry    = MemoryEntry()
         for i in range(MEMORY_VECTOR_SIZE):
             val = float(best_sc.outcomes[0].vector[i])
