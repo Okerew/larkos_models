@@ -1,4 +1,3 @@
-import copy
 import ctypes
 from pathlib import Path
 import numpy as np
@@ -72,22 +71,13 @@ def _mc_samples(
     don't want their graph nodes polluting the training pass.
     Gaussian noise is injected when exploration is above threshold
     so uncertainty estimates stay meaningful even without dropout.
-
-    When exploration is below threshold the only variance source is
-    dropout=0.1, so a small T captures the signal and the mc_blend
-    EMA smooths the rest. We use the full MC_DROPOUT_T only when
-    Gaussian exploration noise is actually being injected, where the
-    variance estimate has to integrate over noisy inputs and needs
-    more samples to be meaningful. Cuts MC cost ~3x on quiet epochs.
     """
     model.train()
-    exploring = exploration_rate > EXPLORE_THRESHOLD
-    T = MC_DROPOUT_T if exploring else max(MC_DROPOUT_T // 3, 2)
     with torch.no_grad():
         samples = []
-        for _ in range(T):
+        for _ in range(MC_DROPOUT_T):
             xi = x
-            if exploring:
+            if exploration_rate > EXPLORE_THRESHOLD:
                 xi = x + exploration_rate * torch.randn_like(x) * 0.05
             samples.append(model(xi, ctx).detach())
         return samples
@@ -448,32 +438,21 @@ class _FusionTransformerHead(nn.Module):
 
 class _TextCodec:
     """
-    Decodes the C-side cognitive_fuse output into text as a READOUT only.
+    Decodes the fused cognitive vector into text as a READOUT only.
 
-      decode : fused-cog vector (FUSION_DIM dims, pre-transformer C output)
+      decode : fused numeric vector (MAX_NEURONS dims)
                -> _num_to_prefix -> (N_PREFIX, GPT2_HIDDEN) prefix
-               -> per-prefix stats matched to wte distribution so GPT-2
-                  sees in-distribution embeddings rather than noise
-               -> prefix prepended to the actual input sentence as a
-                  real text anchor (BOS-only when no anchor given)
-               -> GPT-2 autoregressively continues from that scaffolding
+               -> used as an N_PREFIX-token soft-prompt prefix
+               -> GPT-2 autoregressively continues from it
 
     The bridge is NOT trained. Seven runs established that the prefix
     cannot carry enough information to steer a frozen GPT-2 from an
     8-to-64-dim cognitive vector the LM loss never fell and the gate
     never opened, while the text objective fought base_loss for fused.
     So _num_to_prefix is now a fixed random projection: the text is a
-    pure window into the cognitive vector, not a learned objective.
-
-    Source widened from MAX_NEURONS (8) to FUSION_DIM (64) so the
-    prefix is built from the full pre-transformer fused signal rather
-    than the 8-dim head output. encode() is kept because text_encoding
-    still feeds fused as a state driver via the C-side cognitive_fuse
-    injection and the in-graph text_proj term.
-
-    distilgpt2 replaces gpt2 here: same tokenizer + same GPT2_HIDDEN
-    (768), roughly half the weights and ~2x faster generation. The text
-    is a debug readout so the quality drop is irrelevant.
+    pure window into fused, not a learned objective. encode() is kept
+    because text_encoding still feeds fused as a state driver via the
+    C-side cognitive_fuse injection and the in-graph text_proj term.
     """
 
     def __init__(self, device: str) -> None:
@@ -481,25 +460,17 @@ class _TextCodec:
         self.tok = GPT2Tokenizer.from_pretrained("gpt2")
         self.tok.pad_token = self.tok.eos_token
 
-        self.lm = GPT2LMHeadModel.from_pretrained("distilgpt2")
+        self.lm = GPT2LMHeadModel.from_pretrained("gpt2")
         self.lm.eval()
         self.lm.to(device)
         for p in self.lm.parameters():
             p.requires_grad_(False)
 
         self._num_to_prefix = nn.Linear(
-            FUSION_DIM, N_PREFIX * GPT2_HIDDEN
+            MAX_NEURONS, N_PREFIX * GPT2_HIDDEN
         ).to(device)
         for p in self._num_to_prefix.parameters():
             p.requires_grad_(False)
-
-        # A raw random projection lands far from the wte distribution,
-        # so GPT-2 would decode from out-of-distribution embeddings
-        # noise in, noise out. Cache wte's mean/std once and rescale
-        # every prefix to match before feeding generate().
-        wte = self.lm.transformer.wte.weight.detach()
-        self._wte_mean = wte.mean()
-        self._wte_std  = wte.std()
 
     def encode(self, text: str) -> torch.Tensor:
         enc = self.tok(
@@ -521,48 +492,20 @@ class _TextCodec:
         self,
         numeric_vec: torch.Tensor,
     ) -> torch.Tensor:
-        flat   = self._num_to_prefix(numeric_vec)
-        prefix = flat.view(N_PREFIX, GPT2_HIDDEN)
-        # Rescale to wte's statistics. A near-constant projection
-        # output keeps its zero variance and is filtered in decode().
-        std = prefix.std()
-        if std > 1e-6:
-            prefix = (prefix - prefix.mean()) / std
-        return prefix * self._wte_std + self._wte_mean
+        flat = self._num_to_prefix(numeric_vec)
+        return flat.view(N_PREFIX, GPT2_HIDDEN)
 
-    def decode(
-        self,
-        numeric_vec: torch.Tensor,
-        anchor_text: str | None = None,
-    ) -> str:
+    def decode(self, numeric_vec: torch.Tensor) -> str:
         prefix = self._prefix_from_numeric(numeric_vec).unsqueeze(0)
 
         if not torch.isfinite(prefix).all():
             return ""
-        # A near-constant prefix carries no signal and would only push
-        # GPT-2 to emit the same noise every epoch — skip generation.
-        if prefix.std().item() < 1e-3:
-            return ""
 
-        if anchor_text:
-            # Anchor the generation on the real driver sentence so
-            # GPT-2 has plausible context to continue from; the prefix
-            # then biases the continuation rather than steering blind
-            # from BOS.
-            anchor_ids = self.tok(
-                anchor_text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=32,
-            ).input_ids.to(self.device)
-            anchor_emb = self.lm.transformer.wte(anchor_ids)
-            inputs_embeds = torch.cat([prefix, anchor_emb], dim=1)
-        else:
-            bos_id  = self.tok.bos_token_id
-            bos_emb = self.lm.transformer.wte(
-                torch.tensor([[bos_id]], device=self.device)
-            )
-            inputs_embeds = torch.cat([prefix, bos_emb], dim=1)
+        bos_id  = self.tok.bos_token_id
+        bos_emb = self.lm.transformer.wte(
+            torch.tensor([[bos_id]], device=self.device)
+        )
+        inputs_embeds = torch.cat([prefix, bos_emb], dim=1)
 
         attn_mask = torch.ones(
             1, inputs_embeds.shape[1],
@@ -708,14 +651,6 @@ class TrainingLoop:
         self.model     = LarkosModel().to(DEVICE)
         self.ema       = EMAWrapper(self.model)
 
-        # Persistent MAML clone, built once and refreshed via param
-        # copy each inner update. We deepcopy self.model here so the
-        # EmbeddingProjector.__deepcopy__ override fires — that shares
-        # the frozen 22M-param MiniLM with self.model rather than
-        # loading a second copy. From this point on the inner update
-        # only copies the small trainable subset, not the ST encoder.
-        self.fast_model = copy.deepcopy(self.model).to(DEVICE)
-
         self.fusion_transformer = _FusionTransformerHead(
             output_dim=self.model.output_dim
         ).to(DEVICE)
@@ -764,11 +699,7 @@ class TrainingLoop:
 
         # _num_to_prefix is deliberately absent here: the text bridge
         # is a frozen readout, not a trained head.
-        # AdamW (decoupled weight decay) instead of Adam — Adam folds
-        # WD into the gradient before adaptive scaling, which under-
-        # regularizes; AdamW applies it directly to the weights and is
-        # the correct interpretation of weight_decay=1e-4.
-        self.optimizer = torch.optim.AdamW(
+        self.optimizer = torch.optim.Adam(
             list(self.model.parameters())
             + list(self.fusion_transformer.parameters())
             + list(self.embed_weight_net.parameters())
@@ -959,11 +890,9 @@ class TrainingLoop:
             neuron_pred, dtype=torch.float32
         ).to(DEVICE).unsqueeze(0)
 
-        # MAML inner loop on the persistent fast_model clone (built
-        # once in __init__, refreshed via param copy each epoch)
+        # MAML inner loop on a throw-away clone
         adapted   = maml_inner_update(
             self.model,
-            self.fast_model,
             x_temporal.unsqueeze(0),
             target,
             self.criterion,
@@ -1143,16 +1072,10 @@ class TrainingLoop:
             fused_vec = torch.nan_to_num(
                 fused_vec, nan=0.0, posinf=1.0, neginf=-1.0
             )
-        # decode is a pure readout window into the cognitive state.
-        # We feed the pre-transformer C-side fused vector (FUSION_DIM)
-        # rather than fused_vec (MAX_NEURONS) — 8x more source variance
-        # for the same cost — and anchor on the actual driver sentence
-        # so GPT-2 has real text to continue from rather than steering
-        # blind from BOS. Both changes only affect the debug readout.
-        text_output = self.text_codec.decode(
-            self._last_fused_cog,
-            anchor_text=self._current_text_input,
-        )
+        # decode(fused) is a pure readout now a window into fused,
+        # not a trained objective. text_input is printed alongside it
+        # for debugging the driver sentence that shaped fused.
+        text_output = self.text_codec.decode(fused_vec)
         print(
             f"  [epoch {epoch}] "
             f"text_input  : {self._current_text_input}"

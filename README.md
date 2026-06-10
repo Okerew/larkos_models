@@ -1,4 +1,4 @@
-# <img src="larkos0.1.png" width=25px, height = 25px> Larkos 0.1
+# <img src="larkos0.1.png" width=25px, height = 25px> Larkos 0.2
 
 Self-learning model with a state-based fusion mechanism, transformers that guide the model,
 based on the <a href="https://github.com/Okerew/larkos">larkos architecture</a>.
@@ -58,3 +58,5 @@ outputs/inputs from inference and then again some like 3 training steps that wou
 Cuda is recommended.
 
 The code is licensed under the Apache 2.0 License see [NOTICE](NOTICE) for relevant information.
+
+The previous versions of the models are the larkos_(previous_version) in the source code.

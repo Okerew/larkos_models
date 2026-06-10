@@ -10,7 +10,7 @@
 
 \title{Larkos Training Loop and Inference Runner}
 \author{Witold Warcho\l{}}
-\date{\today}
+\date{June 2, 2026}
 
 \lstset{
   basicstyle=\ttfamily\small,
@@ -24,6 +24,8 @@
 \begin{document}
 
 \maketitle
+
+\textbf{Last updated: \today}
 
 \section{Overview}
 
@@ -123,6 +125,132 @@ where $w = \texttt{TEMPORAL\_WINDOW}$. Earlier positions are zero-padded.
 
 \textbf{Rationale}: Temporal history provides context for the model to
 detect trends and patterns over time, improving predictions.
+
+\subsection{LarkosModel Internals}
+
+The LarkosModel maps the $\text{MODEL\_INPUT\_DIM}$-dim temporal
+observation to a $\text{MAX\_NEURONS}$-dim neuron-output vector. It is
+a transformer encoder over a token sequence built by quantising each
+input dimension into a soft distribution over a learnable vocabulary,
+optionally prepended with a context CLS token.
+
+\subsubsection{NumericTokenizer}
+
+Each input dimension $x^{(i)}$ is encoded as a soft assignment over $V
+= \text{VOCAB\_SIZE}$ learnable prototypes $\{p_j\}_{j=1}^{V}$:
+
+\[
+  w_{ij} = \frac{\exp\big(-(x^{(i)} - p_j)^2\big)}
+                 {\sum_{j'} \exp\big(-(x^{(i)} - p_{j'})^2\big)}
+\]
+
+The per-feature token embedding is then a weighted sum over the
+embedding table $E \in \mathbb{R}^{V \times d_{\text{model}}}$:
+
+\[
+  t_i = \sum_{j=1}^{V} w_{ij}\, E_j \quad \in \mathbb{R}^{d_{\text{model}}}
+\]
+
+producing a sequence $(t_1, \ldots, t_D)$ that the encoder attends
+over.
+
+\textbf{No pre-quantisation projection}: An earlier version applied a
+learnable $\mathbb{R}^{D \times D}$ Linear before the soft assignment.
+It was removed because the per-prototype softmax already gives every
+input dimension its own learnable mapping into the embedding space,
+making the rotation redundant — and free of the $\sim 37$k parameters
+it cost.
+
+\subsubsection{EmbeddingProjector (Context Stream)}
+
+When a context string $s$ is supplied, it is encoded with a frozen
+pretrained sentence-transformer (MiniLM) and projected down to
+$\text{PROJ\_DIM}$:
+
+\[
+  c = \text{LayerNorm}\big(W_{\text{proj}}\cdot \text{ST}(s)\big),
+  \quad \text{ST}(\cdot)\ \text{frozen}.
+\]
+
+It is then projected up to $d_{\text{model}}$ and prepended as a
+CLS-style token, so the encoder output at position $0$ is the summary
+driving the linear head.
+
+\textbf{Per-epoch cache}: The same $s$ is consumed roughly $15\times$
+per epoch (MC samples, main forward, MAML inner steps, verifier).
+EmbeddingProjector memoises the most-recent raw ST output keyed on
+$s$, so $\text{ST}(\cdot)$ fires once per epoch rather than once per
+forward pass.
+
+\textbf{Shared ST under deepcopy}: A custom
+\texttt{\_\_deepcopy\_\_} returns a clone that re-uses the frozen ST
+module by reference. Without this, MAML's per-epoch \texttt{copy.\\
+deepcopy(model)} would clone the $\sim 22$M frozen MiniLM parameters
+on every inner update.
+
+\subsection{Text Bridge (Debug Readout)}
+
+The \texttt{\_TextCodec} renders the C-side cognitive vector as English
+text. It is a \emph{one-way readout}, never trained: previous attempts
+established that an 8-dim cognitive prefix cannot steer a frozen GPT-2,
+and a learned text objective fought $L_{\text{base}}$.
+
+\subsubsection{Source: Cognitive Vector, Not Head Output}
+
+The bridge consumes the C-side $\text{fused\_cog\_raw} \in
+\mathbb{R}^{\text{FUSION\_DIM}}$ vector (pre-transformer) rather than
+the final $\mathbb{R}^{\text{MAX\_NEURONS}}$ head output. The
+\texttt{\_num\_to\_prefix} matrix is
+
+\[
+  W_{n\rightarrow p} \in \mathbb{R}^{
+    (\text{N\_PREFIX}\cdot\text{GPT2\_HIDDEN}) \times \text{FUSION\_DIM}}
+\]
+
+with $\text{requires\_grad}=\text{False}$ (a frozen random projection
+persisted in the checkpoint).
+
+\subsubsection{wte-Stat Matching}
+
+A raw random projection lands far from the GPT-2 token-embedding
+distribution. After projecting and reshaping to $\text{N\_PREFIX} \times
+\text{GPT2\_HIDDEN}$, the prefix is rescaled to match
+$E_{\text{wte}}$ per-tensor statistics:
+
+\[
+  \text{prefix} \leftarrow \frac{\text{prefix} - \mu_{\text{prefix}}}
+                                {\sigma_{\text{prefix}} + \epsilon}
+                          \cdot \sigma_{E_{\text{wte}}}
+                          + \mu_{E_{\text{wte}}}
+\]
+
+so GPT-2 sees something whose moments resemble a real token embedding
+rather than out-of-distribution noise.
+
+\subsubsection{Anchored Decoding}
+
+The driver sentence (\texttt{anchor\_text}) is tokenised, embedded
+through GPT-2's $E_{\text{wte}}$, and concatenated \emph{after} the
+prefix:
+
+\[
+  \text{inputs\_embeds} = [\,\text{prefix},\; E_{\text{wte}}
+                          (\text{anchor\_ids})\,]
+\]
+
+GPT-2 then continues from real text scaffolding while the prefix
+biases the continuation. When no anchor is provided, a single BOS
+embedding is used instead.
+
+\textbf{Degenerate-prefix guard}: If $\sigma(\text{prefix}) < 10^{-3}$
+the prefix carries no signal and would only push GPT-2 to repeat the
+same noise; \texttt{decode()} returns the empty string instead of
+calling \texttt{generate()}.
+
+\textbf{LM choice}: GPT-2 is replaced with \texttt{distilgpt2} —
+identical tokenizer and $\text{GPT2\_HIDDEN}=768$, roughly half the
+weights and $\sim 2\times$ faster. The text is a debug readout, so the
+small quality drop is irrelevant.
 
 \section{Training Loop Architecture}
 
@@ -246,6 +374,34 @@ determine their balance.
 three streams in the output. Attention learns to weight each stream
 appropriately rather than collapsing to one.
 
+\subsection{MAML Inner Loop}
+
+The outer-loss term ($L_{\text{outer}}$, defined below) is computed
+against a \emph{fast clone} adapted to the current task with a few
+inner SGD steps. The clone is built once, at \texttt{TrainingLoop}
+initialisation, via \texttt{copy.deepcopy(self.model)} — the
+\texttt{EmbeddingProjector.\_\_deepcopy\_\_} override ensures the
+$\sim 22$M frozen ST parameters are shared, not duplicated.
+
+Each epoch refreshes only the trainable parameters in place:
+
+\[
+  \forall p_{\text{main}},p_{\text{fast}}: \;
+  p_{\text{main}}.\text{requires\_grad} \Rightarrow
+  p_{\text{fast}}.\text{data} \leftarrow p_{\text{main}}.\text{data}
+\]
+
+then runs $\text{MAML\_INNER\_STEPS}$ vanilla SGD steps on
+$L = \text{MSE}(\text{fast}(x, c), \text{target})$ with
+$\text{lr} = \text{MAML\_INNER\_LR}$. The adapted clone is returned
+and a single forward pass produces $\text{maml\_pred}$.
+
+\textbf{Why a persistent fast clone}: The previous implementation
+re-ran \texttt{copy.deepcopy(model)} inside every inner update — that
+traversed the entire model tree (including the frozen MiniLM) per
+epoch. The persistent clone reduces the per-epoch cost to the
+in-place copy of the small trainable subset.
+
 \subsection{Loss Computation}
 
 The loss is a weighted blend of four components:
@@ -353,6 +509,25 @@ if exploration is above threshold, else zeros (dropout only).
 \[
   \sigma^2_{\text{MC}} = \text{Var}(\text{samples})
 \]
+
+\textbf{Conditional sample count}: $T$ depends on whether the run is
+actively exploring:
+
+\[
+  T = \begin{cases}
+    \text{MC\_DROPOUT\_T} &
+      \text{if } r_{\text{explore}} > \text{EXPLORE\_THRESHOLD} \\
+    \max(\lfloor \text{MC\_DROPOUT\_T}/3 \rfloor, 2) &
+      \text{otherwise}
+  \end{cases}
+\]
+
+When the only variance source is dropout, a small $T$ captures the
+signal and \texttt{mc\_blend} EMA smooths the rest. The full $T$
+fires only when Gaussian exploration noise is actually being injected,
+where the variance estimate has to integrate over noisy inputs and
+needs more samples to be meaningful. This cuts MC cost roughly $3\times$
+on quiet epochs.
 
 \textbf{Rationale}: Uncertainty estimates inform loss weighting. Without
 dropout, variance collapses and weights become uniform. Gaussian noise at
@@ -492,7 +667,11 @@ The runner returns a dictionary with:
   \item \texttt{fused}: The final neuron prediction (NumPy array)
   \item \texttt{model\_pred}: Raw LarkosModel output
   \item \texttt{text\_input}: The driver sentence
-  \item \texttt{text\_output}: Decoded text from the fused vector
+  \item \texttt{text\_output}: Debug-readout text. Decoded by the text
+    bridge (\S\,Text Bridge) from the C-side \texttt{fused\_cog\_raw}
+    (FUSION\_DIM) — \emph{not} the smaller MAX\_NEURONS head output —
+    and anchored on \texttt{\_current\_text\_input} when one is
+    available, so GPT-2 has real text to continue from.
 \end{itemize}
 
 \section{Key Design Decisions}
@@ -536,7 +715,7 @@ provides the needed signal.
 Training uses:
 
 \begin{itemize}
-  \item Optimizer: Adam with $\text{lr} = \text{BASE\_LR}$,
+  \item Optimizer: AdamW with $\text{lr} = \text{BASE\_LR}$,
     $\text{weight\_decay} = 10^{-4}$, $\text{eps} = 10^{-6}$
   \item Scheduler: CosineAnnealingLR with
     $T_{\max} = \text{COSINE\_T\_MAX}$,
@@ -544,6 +723,11 @@ Training uses:
   \item EMA: Exponential moving average of main model weights (used for
     validation and inference)
 \end{itemize}
+
+\textbf{Why AdamW, not Adam}: Adam folds \texttt{weight\_decay} into
+the gradient before adaptive scaling, which under-regularises;
+AdamW applies it directly to the weights and is the correct
+interpretation of $\text{weight\_decay} = 10^{-4}$.
 
 The scheduler steps after each backward pass, ensuring a smooth cosine
 decay over the epoch range.

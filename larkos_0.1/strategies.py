@@ -163,34 +163,22 @@ def update_optimizer_lr(
 
 def maml_inner_update(
     model:     nn.Module,
-    fast:      nn.Module,
     x:         torch.Tensor,
     target:    torch.Tensor,
     criterion: nn.Module,
     embed_ctx: str | None = None,
 ) -> nn.Module:
     """
-    MAML-lite inner loop - refreshes the persistent `fast` clone with
-    the outer model's trainable params and runs a few fast-adaptation
-    SGD steps on it without touching the outer weights. Returns `fast`
-    so the caller can compute the outer loss against it; the original
-    model is untouched.
+    MAML-lite inner loop - runs a few fast-adaptation gradient
+    steps on a cloned model without touching the outer weights.
+    Returns the adapted clone so the caller can compute the
+    outer loss against it; the original model is untouched.
 
-    `fast` must be a same-shape sibling of `model` (built with the
-    same constructor). Only `requires_grad` params are refreshed, so
-    frozen submodules (e.g. the pretrained ST encoder) are NOT recopied
-    — the per-epoch cost stays at the small trainable subset rather
-    than the 22M-param frozen MiniLM the old copy.deepcopy(model)
-    pulled in.
-
-    We skip this when embed_ctx is None - the embedding path is the
-    main signal that benefits from fast adaptation and running it on
-    raw numerics alone gives negligible gain.
+    We skip this when embed_ctx is None - the embedding path
+    is the main signal that benefits from fast adaptation and
+    running it on raw numerics alone gives negligible gain.
     """
-    with torch.no_grad():
-        for p_main, p_fast in zip(model.parameters(), fast.parameters()):
-            if p_main.requires_grad:
-                p_fast.data.copy_(p_main.data)
+    fast = copy.deepcopy(model)
     fast.train()
     inner_opt = torch.optim.SGD(
         fast.parameters(), lr=MAML_INNER_LR
