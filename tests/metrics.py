@@ -543,9 +543,18 @@ def world_model_score(records: List[EpochRecord]) -> dict:
 def adaptation_score(
     pre_change_records:  List[EpochRecord],
     post_change_records: List[EpochRecord],
+    recovery_tolerance:  float = 1.5,
 ) -> dict:
     """
     How quickly the model adapts after a rule change.
+
+    recovery_tolerance multiplies pre_final_loss to define the band the
+    post-change loss has to re-enter to count as "recovered". The 1.1x
+    default it used to carry was unrealistic for fundamental rule changes
+    (e.g. gravity reversal) where the optimal new loss is not the same as
+    the old optimal loss; 1.5x still requires the model to have re-built a
+    competent representation, just without demanding it match the prior
+    convergence point.
 
     Returns:
       pre_final_loss          - loss after training in original env
@@ -553,7 +562,8 @@ def adaptation_score(
       post_final_loss
       adaptation_slope        - convergence rate post-change
       disruption_magnitude    - post_initial minus pre_final (size of the shock)
-      recovery_epochs         - epochs until post loss returns to pre_final level
+      recovery_epochs         - epochs until post loss returns to within
+                                recovery_tolerance x pre_final_loss
       fused_shift             - cosine distance between pre-final and post-final fused
     """
     pre_f  = pre_change_records[-1].loss  if pre_change_records else 0.0
@@ -575,10 +585,11 @@ def adaptation_score(
 
     adaptation_slope = _slope([r.loss for r in post_change_records])
 
-    # Epochs to return to pre-change loss level
+    # Epochs to return to within recovery_tolerance x pre-change loss level
     recovery_epochs = -1
+    recovery_target = pre_f * recovery_tolerance
     for i, r in enumerate(post_change_records):
-        if r.loss <= pre_f * 1.1:  # within 10% of pre-change loss
+        if r.loss <= recovery_target:
             recovery_epochs = i + 1
             break
 

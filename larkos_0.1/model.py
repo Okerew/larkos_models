@@ -49,12 +49,15 @@ class NumericTokenizer(nn.Module):
             torch.linspace(-3.0, 3.0, vocab_size)
         )
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.in_proj   = nn.Linear(in_dim, in_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x : (B, D) or (D,)
         was_1d = x.dim() == 1
         if was_1d:
             x = x.unsqueeze(0)
+
+        x = self.in_proj(x)
 
         # Soft assignment: distance of each feature to each prototype
         # -> (B, D, V)
@@ -87,42 +90,20 @@ class EmbeddingProjector(nn.Module):
             p.requires_grad = False
         self.proj = nn.Linear(embed_dim, proj_dim)
         self.norm = nn.LayerNorm(proj_dim)
-        # ST encode is the most expensive call in the model's forward
-        # path and the same embed_ctx string is reused ~15x per epoch
-        # (MC samples, MAML inner steps, verification). Cache the last
-        # raw ST output keyed on the string so re-encoding only fires
-        # when the string actually changes.
-        self._last_text: str | None     = None
-        self._last_raw:  torch.Tensor | None = None
 
     def encode_text(self, text: str) -> torch.Tensor:
-        if text != self._last_text or self._last_raw is None:
-            self._last_raw  = self._st.encode(
-                text,
-                convert_to_tensor=True,
-                device=DEVICE,
-            )
-            self._last_text = text
+        raw = self._st.encode(
+            text,
+            convert_to_tensor=True,
+            device=DEVICE,
+        )
         # ST encode runs under inference_mode internally so the
         # returned tensor can't enter the autograd graph directly
         # - clone() pulls it out into a normal tracked tensor
-        return self.norm(self.proj(self._last_raw.clone()))
+        return self.norm(self.proj(raw.clone()))
 
     def forward(self, text: str) -> torch.Tensor:
         return self.encode_text(text)
-
-    def __deepcopy__(self, memo):
-        # MAML deepcopies LarkosModel every inner update; the frozen
-        # 22M-param MiniLM should be SHARED with the original, not
-        # copied. Copying it is most of the per-epoch deepcopy cost.
-        new = self.__class__.__new__(self.__class__)
-        nn.Module.__init__(new)
-        new._st        = self._st
-        new.proj       = copy.deepcopy(self.proj, memo)
-        new.norm       = copy.deepcopy(self.norm, memo)
-        new._last_text = self._last_text
-        new._last_raw  = self._last_raw
-        return new
 
 
 class LarkosModel(nn.Module):

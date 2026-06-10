@@ -253,21 +253,7 @@ class LarkosRunner:
             fused_vec = torch.nan_to_num(
                 fused_vec, nan=0.0, posinf=1.0, neginf=-1.0
             )
-        # Decode reads from the C-side pre-transformer fused vector
-        # (FUSION_DIM) — same widening as the training loop after the
-        # bridge source dim moved from MAX_NEURONS to FUSION_DIM. The
-        # current driver sentence anchors the generation so GPT-2 has
-        # real context to continue from.
-        fused_cog_for_decode = fused_cog_raw.detach()
-        if not torch.isfinite(fused_cog_for_decode).all():
-            fused_cog_for_decode = torch.nan_to_num(
-                fused_cog_for_decode,
-                nan=0.0, posinf=1.0, neginf=-1.0,
-            )
-        text_output = self.text_codec.decode(
-            fused_cog_for_decode,
-            anchor_text=self._current_text_input or None,
-        )
+        text_output = self.text_codec.decode(fused_vec)
 
         return {
             "fused":       fused_vec.cpu().numpy(),

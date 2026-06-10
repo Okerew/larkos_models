@@ -156,18 +156,7 @@ def load_checkpoint(
         filename, map_location=DEVICE, weights_only=False
     )
 
-    # strict=False so an older checkpoint whose module structure has
-    # since changed (e.g. removed NumericTokenizer.in_proj) still loads
-    # — the obsolete keys are dropped and any new keys keep their fresh
-    # init. The missing/unexpected sets are surfaced for visibility.
-    _missing, _unexpected = loop.model.load_state_dict(
-        ckpt["model"], strict=False
-    )
-    if _missing or _unexpected:
-        print(
-            f"  model load: missing={list(_missing)} "
-            f"unexpected={list(_unexpected)}"
-        )
+    loop.model.load_state_dict(ckpt["model"])
     loop.fusion_transformer.load_state_dict(
         ckpt["fusion_transformer"]
     )
@@ -176,28 +165,13 @@ def load_checkpoint(
     loop.text_proj.load_state_dict(ckpt["text_proj"])
 
     # shadow is a plain state_dict, not a module assign the restored
-    # dict straight back, moving each tensor onto DEVICE. Filter to keys
-    # the current model actually exposes so dropped keys (e.g. tokenizer
-    # in_proj) don't poison apply_shadow's load_state_dict downstream.
-    _live_keys = set(loop.model.state_dict().keys())
+    # dict straight back, moving each tensor onto DEVICE.
     loop.ema.shadow = {
-        k: v.to(DEVICE)
-        for k, v in ckpt["ema_shadow"].items()
-        if k in _live_keys
+        k: v.to(DEVICE) for k, v in ckpt["ema_shadow"].items()
     }
-    # _num_to_prefix is a frozen random projection. If its source dim
-    # changed (e.g. MAX_NEURONS=8 -> FUSION_DIM=64) the saved weights
-    # can't load and the new random init is the only valid value
-    # anyway — there's no meaningful transfer for a non-trained head.
-    try:
-        loop.text_codec._num_to_prefix.load_state_dict(
-            ckpt["text_num_to_prefix"]
-        )
-    except RuntimeError as e:
-        print(
-            f"  text_num_to_prefix load skipped ({e.__class__.__name__}): "
-            f"keeping fresh random projection"
-        )
+    loop.text_codec._num_to_prefix.load_state_dict(
+        ckpt["text_num_to_prefix"]
+    )
 
     _load_online_minmax(loop.online_norm, ckpt["online_norm"])
     _load_online_meanstd(
@@ -215,7 +189,7 @@ def load_checkpoint(
     for t in ckpt["input_history"]:
         loop.input_history.append(t)
 
-    # Don't restore the sample pool / text input from the old run —
+    # Don't restore the sample pool / text input from the old run -
     # the user may have changed data_dir, and a stale pool of old-domain
     # samples would prevent the new pipeline from ever being consulted.
     # The caller must re-seed these from the new data pipeline.
