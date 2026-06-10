@@ -10,3 +10,5 @@ venv
 dist
 build
 *.egg-info
+larkos_0.1
+Documents
