@@ -127,6 +127,12 @@ def bind(lib: CDLL):
     lib.consolidateMemory.argtypes = [POINTER(MemorySystem)]
     lib.consolidateMemory.restype  = None
 
+    lib.addToDirectMemory.argtypes = [
+        POINTER(MemorySystem),
+        POINTER(MemoryEntry),
+    ]
+    lib.addToDirectMemory.restype = None
+
     lib.consolidateToLongTermMemory.argtypes = [
         POINTER(WorkingMemorySystem),
         POINTER(MemorySystem),

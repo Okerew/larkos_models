@@ -1,6 +1,6 @@
 from ctypes import (
     CDLL, Structure, c_float, c_uint, c_int,
-    POINTER, cast, c_void_p, c_uint32,
+    POINTER, cast, c_void_p, c_uint32, byref,
 )
 import math
 import numpy as np
@@ -790,7 +790,7 @@ class BackendState:
         entry.importance = c_float(best_score)
         entry.timestamp  = c_uint(self._step_counter)
 
-        self.lib.addToDirectMemory(self.mem_sys, entry)
+        self.lib.addToDirectMemory(self.mem_sys, byref(entry))
         return {
             "status":     "ok",
             "op":         "store_best_imagination_to_memory",
