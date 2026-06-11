@@ -1,6 +1,6 @@
 from ctypes import (
     CDLL, Structure,
-    c_float, c_int, c_bool, c_uint,
+    c_float, c_int, c_bool, c_uint, c_char,
     POINTER, c_void_p,
 )
 
@@ -13,7 +13,7 @@ class ReflectionMetrics(Structure):
         ("coherence_score",         c_float),
         ("novelty_score",           c_float),
         ("consistency_score",       c_float),
-        ("reasoning",               c_float * REASONING_SIZE),
+        ("reasoning",               c_char * REASONING_SIZE),
         ("potentially_confabulated",c_bool),
     ]
 
