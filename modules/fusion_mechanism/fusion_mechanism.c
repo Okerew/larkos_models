@@ -43,7 +43,7 @@
  * fusion head no longer consumed. The whole vector is layer-normed
  * and lightly cross-mixed so the transformer still sees interactions
  * between the two surviving bands. */
-#define BAND_Q 32 // llm query band  (TEMPORARY 8N; was 342)
+#define BAND_Q 32 // llm query band  
 #define BAND_M 32 // memory band     (BAND_Q + BAND_M == FUSION_DIM)
 #define FUSION_DIM (BAND_Q + BAND_M) // 64 at 8N
 
