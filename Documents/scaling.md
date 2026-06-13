@@ -29,7 +29,7 @@ MODEL_INPUT_DIM = TEMPORAL_WINDOW * 2 * INPUT_SIZE * FOURIER_ENCODINGS
 
 scaling any of these by 2× scales attention memory by ~4×. Scaling
 `FOURIER_ENCODINGS` 16× (4→64) scales attention memory by ~256× — that
-alone is enough to OOM a 12 GiB GPU regardless of `D_MODEL`.
+alone is enough to OOM most GPUs regardless of `D_MODEL`.
 
 **Therefore: `FOURIER_ENCODINGS` and `TEMPORAL_WINDOW` do NOT scale with
 `MAX_NEURONS`. Treat them as fixed hyperparameters of the feature
@@ -47,17 +47,18 @@ Per training step, peak attention activations are dominated by
 
 (the ×5 covers attn weights + softmax + dropout mask + Q/K/V intermediates
 saved for backward). At `MODEL_INPUT_DIM ≈ 512`, `NHEAD=32`, `N_LAYERS=8`
-this is ~1 GB — fits comfortably in 12 GiB alongside the fusion head and
-parameters. At `MODEL_INPUT_DIM ≈ 16 000` it is ~1 TB, which is why
-12 GiB cards OOM instantly.
+this is ~1 GB. At `MODEL_INPUT_DIM ≈ 16 000` the same formula gives ~1 TB,
+which is why anything that inflates `MODEL_INPUT_DIM` — especially
+`FOURIER_ENCODINGS` — blows past available VRAM almost regardless of how
+small you make the other constants.
 
-Rule of thumb caps for `MODEL_INPUT_DIM`:
-
-| GPU VRAM | safe `MODEL_INPUT_DIM` cap |
-|---|---|
-| 12 GiB | ≲ 1024 |
-| 24 GiB | ≲ 2048 |
-| 40 GiB+ | ≲ 4096, beyond that use gradient checkpointing |
+To size `MODEL_INPUT_DIM` for your hardware: plug your `NHEAD` and
+`N_LAYERS` into the formula above, compare against the VRAM left after
+parameters, optimizer state, and the fusion head, and pick the largest
+`MODEL_INPUT_DIM` that still leaves headroom. If you need a larger cap
+than fits, enable gradient checkpointing before shrinking the other
+constants — it trades a 1.3–1.5× slowdown for a major drop in activation
+memory.
 
 ---
 
@@ -202,6 +203,7 @@ Notes:
   even decreasing** across the columns — they belong to the feature
   extractor, not the model, and inflating them is what causes OOM on
   consumer GPUs (see the sequence-length pitfall section).
-- At 128N on a 12 GiB GPU, `TEMPORAL_WINDOW` is dropped to 2 and
-  `MC_DROPOUT_T` to 4 to keep peak VRAM under ~6 GB. On a 24 GiB+ GPU you
-  can restore them to 4 and 10.
+- The 128N column drops `TEMPORAL_WINDOW` to 2 and `MC_DROPOUT_T` to 4 so
+  peak training VRAM stays around ~6 GB, which is the band most consumer
+  GPUs sit in. If you have headroom, restore `TEMPORAL_WINDOW=4` and
+  `MC_DROPOUT_T=10` for better uncertainty estimates and generalisation.
