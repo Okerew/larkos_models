@@ -207,3 +207,4 @@ Notes:
   peak training VRAM stays around ~6 GB, which is the band most consumer
   GPUs sit in. If you have headroom, restore `TEMPORAL_WINDOW=4` and
   `MC_DROPOUT_T=10` for better uncertainty estimates and generalisation.
+- Scale thins like memory capacity and history sizes for the C backend stuff also.
