@@ -16,22 +16,11 @@ EMBED_MODEL_NAME = (
 )
 EMBED_DIM   = 384
 PROJ_DIM    = 32
-D_NODE = 8
 
 FOURIER_ENCODINGS = 4
-# 4 frames of attended history. TEMPORAL_WINDOW enters MODEL_INPUT_DIM
-# linearly and attention memory quadratically — at 8N the seq_len is
-# TEMPORAL_WINDOW * 2 * INPUT_SIZE * FOURIER_ENCODINGS = 192, well
-# within budget.
 TEMPORAL_WINDOW   = 4
 FOURIER_OUT_DIM   = 2 * INPUT_SIZE * FOURIER_ENCODINGS  # 48
 MODEL_INPUT_DIM   = TEMPORAL_WINDOW * FOURIER_OUT_DIM     # 192
-
-# Temporal-axis attention encoder. d_model = FOURIER_OUT_DIM = 48; nhead
-# must divide d_model so 4 is the sane pick at this scale.
-TEMPORAL_NHEAD  = 4
-TEMPORAL_LAYERS = 2
-TEMPORAL_DIM_FF = 64
 
 EMA_DECAY   = 0.995
 
@@ -55,28 +44,16 @@ N_LAYERS   = 2
 DIM_FF     = 64
 DROPOUT    = 0.1
 
-# Training. FUSION_DIM = BAND_Q + BAND_M after BAND_N was retired from
-# cognitive_fuse — see Documents/scaling.md.
+# Training
 FUSION_DIM          = 64
 MC_DROPOUT_T       = 10
 EXPLORE_THRESHOLD  = 0.15
 INTERNAL_DIM       = MAX_NEURONS
 
-# Graph-reasoning fusion head: attends over per-neuron tokens from the
-# GAT plus a handful of context tokens (band_q, band_m, driver).
-# Head capacity bumped (32→64 d_model, +1 layer, 64→128 dim_ff) after
-# the 0.3 refactor dropped the absolute loss floor on harder domains;
-# the sequence is MAX_NEURONS+3 tokens, so the head needs enough width
-# to mix per-neuron content with the Q/M/driver context.
-FUSE_GRAPH_DMODEL = 64
-FUSE_GRAPH_NHEAD  = 4
-FUSE_GRAPH_LAYERS = 3
-FUSE_GRAPH_DIM_FF = 128
-
-# Neuron-graph attention layer. Hand-rolled GAT over the MAX_NEURONS
-# graph exposed by backend_state.get_neurons().
-GAT_HEADS  = 2
-GAT_LAYERS = 2
+# Fusion transformer head
+FUSE_NHEAD   = 4
+FUSE_N_LAYER = 2
+FUSE_DIM_FF  = 64
 
 # Text codec
 GPT2_HIDDEN  = 768
@@ -111,8 +88,8 @@ TEXT_COLUMN_HINTS = (
 )
 
 # Backend shared constants
-MAX_CONNECTIONS    = 32
-MEMORY_VECTOR_SIZE = 2 * MAX_NEURONS + INPUT_SIZE  # 288 (2*128+32)
+MAX_CONNECTIONS    = 6
+MEMORY_VECTOR_SIZE = 2 * MAX_NEURONS + INPUT_SIZE  # 22
 
 # Input tensor builder, EDIT THIS when you change INPUT_SIZE / MAX_NEURONS
 def build_input_tensor(
@@ -168,7 +145,7 @@ MAX_BOND_SHARED_HISTORY   = 32
 # Specialization
 MAX_SPECIALIZATIONS       = 8
 MAX_SPECIALIZED_NEURONS   = 64
-ACTIVATION_HISTORY_SIZE   = 200
+ACTIVATION_HISTORY_SIZE   = 50
 SPEC_NONE                 = 0
 SPEC_PATTERN_DETECTOR     = 1
 SPEC_FEATURE_EXTRACTOR    = 2
@@ -180,17 +157,17 @@ SPEC_EMOTIONAL_PROCESSOR  = 7
 SPEC_PREDICTION_GENERATOR = 8
 
 # Memory
-FEATURE_VECTOR_SIZE       = 512
-CONTEXT_VECTOR_SIZE       = 1024
-MEMORY_CAPACITY           = 1000
+FEATURE_VECTOR_SIZE       = 128
+CONTEXT_VECTOR_SIZE       = 256
+MEMORY_CAPACITY           = 100
 
 # Self identity
 PATTERN_SIZE              = 3
-EXPERIENCE_VECTOR_SIZE    = 1024
+EXPERIENCE_VECTOR_SIZE    = 256
 
 # Reflections
-REASONING_SIZE            = 4096
-HISTORY_SIZE              = 500
+REASONING_SIZE            = 1024
+HISTORY_SIZE              = 100
 
 # Decision path
 NUM_PATHS                 = 5
@@ -201,32 +178,24 @@ HISTORY_LENGTH            = 10
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Modules whose grad norm is structurally orders of magnitude below
-# the in-graph fusion_transformer and should NOT trigger the grad
-# imbalance warning. Two flavours qualify:
-#   - cut-then-aux: gradient is cut from the main loss by the C-side
-#     detach and only re-enters via aux_loss (embed_weight_net,
-#     cross_attn, text_proj).
-#   - far-upstream: gradient flows through many layers of the model
-#     before reaching the module, so chain-rule attenuation alone
-#     puts it 1e4-1e5 below the head (temporal_encoder).
-# In both cases the module is still tracked for dead_module /
-# oscillation checks — only the head-vs-this-module ratio is skipped.
+# Modules whose gradient is cut from the main loss by the C-side
+# detach and only re-enters via aux_loss. Their grad norm is
+# legitimately orders of magnitude below the in-graph transformer,
+# so they are excluded from the balance ratio (but not from the
+# dead-module / oscillation checks).
 DETACHED_LABELS = frozenset({
     "embed_weight_net",
     "cross_attn",
     "text_proj",
-    "temporal_encoder",
 })
 
 CHECKPOINT_VERSION = 1
 
-# Band layout must match the BAND_Q / BAND_M split in
+# Band layout must match the BAND_Q / BAND_N / BAND_M split in
 # fusion_mechanism.c. If those change in C these must change in lockstep.
-# BAND_N was removed when the GAT replaced the C-side neuron projection;
-# FUSION_DIM = BAND_Q + BAND_M.
-BAND_Q = 32
-BAND_M = 32
+BAND_Q = 22
+BAND_N = 21
+BAND_M = 21
 
 # Test-data domains
 TEST_DATA = "test_data"

@@ -1,4 +1,4 @@
-# <img src="larkos0.1.png" width=25px, height = 25px> Larkos 0.2
+# <img src="larkos0.1.png" width=25px, height = 25px> Larkos 0.3
 
 Self-learning model with a state-based fusion mechanism, transformers that guide the model,
 based on the <a href="https://github.com/Okerew/larkos">larkos architecture</a>.

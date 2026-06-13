@@ -1,6 +1,6 @@
 import torch
 
-from modules.config import DEVICE, CHECKPOINT_VERSION, FUSION_DIM
+from modules.config import DEVICE, CHECKPOINT_VERSION
 
 
 def _serialise_online_minmax(norm) -> dict:
@@ -79,8 +79,6 @@ def save_checkpoint(loop, filename: str = "larkos_model.pt") -> dict:
 
         "model":              loop.model.state_dict(),
         "fusion_transformer": loop.fusion_transformer.state_dict(),
-        "graph_reasoner":     loop.graph_reasoner.state_dict(),
-        "temporal_encoder":   loop.temporal_encoder.state_dict(),
         "embed_weight_net":   loop.embed_weight_net.state_dict(),
         "cross_attn":         loop.cross_attn.state_dict(),
         "text_proj":          loop.text_proj.state_dict(),
@@ -116,15 +114,6 @@ def save_checkpoint(loop, filename: str = "larkos_model.pt") -> dict:
         ),
         "target_epoch":     loop._target_epoch,
         "cached_fused_cog": _maybe_tensor(loop._cached_fused_cog),
-        # New freeze-cache entry introduced by the graph-reasoning
-        # fusion head — same shape contract as cached_fused_cog (None
-        # or a detached CPU tensor) so old checkpoints loaded under the
-        # new code see None and start a fresh freeze window.
-        # graph_tokens are NOT cached: the GAT needs gradient through
-        # the freeze window or it dies (see TrainingLoop.__init__).
-        "cached_driver": _maybe_tensor(
-            getattr(loop, "_cached_driver", None)
-        ),
 
         # Temporal input window feeds x_temporal; without it the first
         # few forward passes run on zero-padded history instead of the
@@ -179,61 +168,9 @@ def load_checkpoint(
             f"  model load: missing={list(_missing)} "
             f"unexpected={list(_unexpected)}"
         )
-    # strict=False so an old pre-graph-head checkpoint whose
-    # fusion_transformer carried proj_q/proj_n/proj_m/stream_embed (the
-    # 3-stream layout) loads cleanly onto the new mixed-token head —
-    # the obsolete keys are dropped and the new layers (proj_driver,
-    # token_type_embed, pool_query, etc.) keep their fresh init. Same
-    # idea downstream for graph_reasoner: an old checkpoint won't have
-    # the key at all, so the freshly init'd reasoner runs as-is.
-    _ft_missing, _ft_unexpected = loop.fusion_transformer.load_state_dict(
-        ckpt["fusion_transformer"], strict=False
+    loop.fusion_transformer.load_state_dict(
+        ckpt["fusion_transformer"]
     )
-    if _ft_missing or _ft_unexpected:
-        print(
-            f"  fusion_transformer load: missing={list(_ft_missing)} "
-            f"unexpected={list(_ft_unexpected)}"
-        )
-    _gr_state = ckpt.get("graph_reasoner")
-    if _gr_state is not None:
-        # strict=False so a checkpoint from before _D_NODE grew (5→8)
-        # or before neuron_embed existed still loads — the new tensors
-        # stay at their fresh init, which is the safest default when
-        # the shape contract changes.
-        _gr_missing, _gr_unexpected = loop.graph_reasoner.load_state_dict(
-            _gr_state, strict=False
-        )
-        if _gr_missing or _gr_unexpected:
-            print(
-                f"  graph_reasoner load: missing={list(_gr_missing)} "
-                f"unexpected={list(_gr_unexpected)}"
-            )
-    else:
-        print(
-            "  graph_reasoner load: no entry in checkpoint — "
-            "keeping fresh init"
-        )
-    # temporal_encoder added when TEMPORAL_WINDOW grew beyond 2. Old
-    # checkpoints predate the encoder entirely, and any checkpoint
-    # saved with a different TEMPORAL_WINDOW will have a positional
-    # embedding tensor of a different shape. strict=False tolerates
-    # both — log what was missing / unexpected so a config change is
-    # visible at load time.
-    _te_state = ckpt.get("temporal_encoder")
-    if _te_state is not None:
-        _te_missing, _te_unexpected = loop.temporal_encoder.load_state_dict(
-            _te_state, strict=False
-        )
-        if _te_missing or _te_unexpected:
-            print(
-                f"  temporal_encoder load: missing={list(_te_missing)} "
-                f"unexpected={list(_te_unexpected)}"
-            )
-    else:
-        print(
-            "  temporal_encoder load: no entry in checkpoint — "
-            "keeping fresh init"
-        )
     loop.embed_weight_net.load_state_dict(ckpt["embed_weight_net"])
     loop.cross_attn.load_state_dict(ckpt["cross_attn"])
     loop.text_proj.load_state_dict(ckpt["text_proj"])
@@ -263,51 +200,15 @@ def load_checkpoint(
         )
 
     _load_online_minmax(loop.online_norm, ckpt["online_norm"])
-    # FUSION_DIM shrank from 1024 to 683 when BAND_N was retired from
-    # cognitive_fuse, so a checkpoint saved under the old layout has
-    # fused_cog_norm.mean/var sized to the old dim. The running stats
-    # are EMA estimates that will rebuild from the next refresh-epoch's
-    # _last_fused_cog anyway, so dropping the stale tensors is safe —
-    # the freshly init'd _OnlineMeanStd starts seeded and gets seen=False.
-    _fcn_state = ckpt["fused_cog_norm"]
-    if _fcn_state["mean"].shape == loop.fused_cog_norm.mean.shape:
-        _load_online_meanstd(loop.fused_cog_norm, _fcn_state)
-    else:
-        print(
-            "  fused_cog_norm load skipped: dim mismatch "
-            f"(ckpt {tuple(_fcn_state['mean'].shape)} vs live "
-            f"{tuple(loop.fused_cog_norm.mean.shape)}) — "
-            "stats will re-seed from live data"
-        )
+    _load_online_meanstd(
+        loop.fused_cog_norm, ckpt["fused_cog_norm"]
+    )
 
     loop._cached_target = ckpt["cached_target"]
     loop._target_epoch  = ckpt["target_epoch"]
     _cfc = ckpt["cached_fused_cog"]
-    # FUSION_DIM may have changed since this checkpoint was saved (the
-    # post-BAND_N-retirement layout is 683-d, the old layout was 1024).
-    # The cache feeds the fusion head's split_band_q_m which slices
-    # FUSION_DIM-shaped vectors, so reusing an old-dim cache would
-    # mis-slice. Drop the stale cache and let the next refresh epoch
-    # rebuild it under the new layout.
-    if _cfc is not None and _cfc.shape[-1] != FUSION_DIM:
-        print(
-            "  cached_fused_cog skipped: dim mismatch "
-            f"(ckpt {tuple(_cfc.shape)} vs FUSION_DIM={FUSION_DIM}) — "
-            "rebuilding on next refresh epoch"
-        )
-        _cfc = None
     loop._cached_fused_cog = (
         None if _cfc is None else _cfc.to(DEVICE)
-    )
-    # Old checkpoints don't carry cached_driver — .get() returns None
-    # and the next refresh epoch will rebuild it. Either way the loop /
-    # runner already declared the attribute in __init__. The legacy
-    # cached_graph_tokens key (written by an earlier version of this
-    # head) is intentionally ignored: graph_tokens are no longer cached
-    # because doing so cut gradient to the GAT every frozen epoch.
-    _cdr = ckpt.get("cached_driver")
-    loop._cached_driver = (
-        None if _cdr is None else _cdr.to(DEVICE)
     )
 
     loop.input_history.clear()
@@ -329,9 +230,8 @@ def load_checkpoint(
         loop.ema.apply_shadow(loop.model)
 
     for module in (
-        loop.model, loop.temporal_encoder, loop.graph_reasoner,
-        loop.fusion_transformer, loop.embed_weight_net,
-        loop.cross_attn, loop.text_proj,
+        loop.model, loop.fusion_transformer,
+        loop.embed_weight_net, loop.cross_attn, loop.text_proj,
     ):
         module.to(DEVICE)
 

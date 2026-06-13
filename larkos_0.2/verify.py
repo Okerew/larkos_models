@@ -3,9 +3,8 @@ import torch.nn as nn
 from dataclasses import dataclass, field
 
 from modules.config import (
-    DEVICE, MAX_NEURONS, INPUT_SIZE, INTERNAL_DIM,
+    DEVICE, MAX_NEURONS, INPUT_SIZE,
     FOURIER_OUT_DIM, TEMPORAL_WINDOW,
-    BAND_Q, BAND_M, FUSE_GRAPH_DMODEL,
     GRAD_FLOOR, ACT_UPPER,
     OVERFIT_STEPS, OVERFIT_THRESH,
     LOSS_SPIKE_RATIO, LOSS_PLATEAU_DELTA,
@@ -158,26 +157,24 @@ def check_fourier_reach(
     x_temporal: torch.Tensor,
 ) -> None:
     """
-    Verifies the Fourier encoding is non-trivial and that signal
-    propagated through to x_temporal — a zero last slice here means
-    the temporal encoder or padding logic buried the signal.
-
-    The old strict-equality probe (last slice == raw x_fourier) does
-    not apply anymore because the temporal encoder transforms each
-    frame before flattening. We now check the weaker but still useful
-    property that the latest slice of x_temporal carries non-trivial
-    magnitude.
+    Verifies the Fourier encoding is non-trivial and that it
+    actually made it into x_temporal intact — a zero slice here
+    means the padding logic buried the signal.
     """
     if x_fourier.abs().max().item() < 1e-6:
         r.fail("fourier:output", "all-zero — encoding did nothing")
         return
     r.ok("fourier:output")
 
+    # x_temporal is TEMPORAL_WINDOW copies cat'd along last dim;
+    # the most recent slice lives at the end
     last_slice = x_temporal[-FOURIER_OUT_DIM:]
-    if last_slice.abs().max().item() < 1e-6:
+    if not torch.allclose(
+        last_slice.cpu(), x_fourier.detach().cpu(), atol=1e-5
+    ):
         r.fail(
             "fourier:temporal_reach",
-            "last slice of x_temporal is all-zero — signal dropped",
+            "latest Fourier slice not found at end of x_temporal",
         )
     else:
         r.ok("fourier:temporal_reach")
@@ -271,51 +268,24 @@ def check_fusion_transformer(
     """
     Runs a single forward + backward through the fusion transformer
     in isolation to confirm the transformer path is fully connected.
-
-    The refactored head takes four separate inputs (graph_tokens,
-    band_q, band_m, driver). We synthesize each with requires_grad and
-    confirm gradient flows back to all four — a stronger probe than the
-    old single-input check, since a stuck token-type-embedding or proj
-    head now shows up as one specific input losing its gradient.
     """
-    device = next(fusion_transformer.parameters()).device
+    inp   = fused_cog.detach().unsqueeze(0).requires_grad_(True)
+    out   = fusion_transformer(inp)
+    dummy = out.sum()
+    dummy.backward()
 
-    graph_tokens = torch.randn(
-        1, MAX_NEURONS, FUSE_GRAPH_DMODEL, device=device, requires_grad=True,
-    )
-    band_q = torch.randn(1, BAND_Q,       device=device, requires_grad=True)
-    band_m = torch.randn(1, BAND_M,       device=device, requires_grad=True)
-    driver = torch.randn(1, INTERNAL_DIM, device=device, requires_grad=True)
-
-    out = fusion_transformer(
-        graph_tokens = graph_tokens,
-        band_q       = band_q,
-        band_m       = band_m,
-        driver       = driver,
-        frozen_input = False,
-    )
-    out.sum().backward()
-
-    for name, inp in (
-        ("graph_tokens", graph_tokens),
-        ("band_q",       band_q),
-        ("band_m",       band_m),
-        ("driver",       driver),
-    ):
-        if inp.grad is None or inp.grad.norm().item() < GRAD_FLOOR:
-            r.fail(
-                f"fusion_transformer:grad:{name}",
-                "no gradient returned to input — path broken",
-            )
-        else:
-            r.ok(f"fusion_transformer:grad:{name}")
+    if inp.grad is None or inp.grad.norm().item() < GRAD_FLOOR:
+        r.fail(
+            "fusion_transformer:grad",
+            "no gradient returned to input — path broken",
+        )
+    else:
+        r.ok("fusion_transformer:grad")
 
     if not torch.isfinite(out).all():
         r.fail("fusion_transformer:output", "NaN/Inf in output")
     else:
         r.ok("fusion_transformer:output")
-
-    _ = fused_cog  # kept for signature compatibility; not used now
 
 
 def check_loss_health(
@@ -509,13 +479,6 @@ class LearningPatternTracker:
         Checks whether a learning rate change actually produced a
         measurable loss response. Insensitivity usually means the
         optimiser is stuck in a flat region or lr is too small.
-
-        The threshold scales with the current loss regime: an absolute
-        delta of 0.04 against a converged loss of 0.15 is a 27 % move,
-        not "stuck", but the previous fixed-0.05 threshold flagged it.
-        We use a 15 %-of-loss requirement, floored by a small absolute
-        delta (LR_SENSITIVITY_DELTA / 10) so the check still fires on
-        true plateaus where both relative and absolute deltas are tiny.
         """
         if len(self.lr_history) < 3:
             return
@@ -528,29 +491,19 @@ class LearningPatternTracker:
             # lr changed at step i — check loss delta that followed
             if i >= len(self.loss_at_lr):
                 break
-            loss_after = self.loss_at_lr[i][1]
             delta = abs(
-                loss_after - self.loss_at_lr[i - 1][1]
+                self.loss_at_lr[i][1] - self.loss_at_lr[i - 1][1]
             )
-            # 15 % of the current loss, floored by a small absolute
-            # delta so a pathological loss=0 case still has a finite
-            # threshold. At loss=0.5 → threshold≈0.075; at loss=0.15
-            # → threshold≈0.0225; absolute floor ≈ 0.005.
-            threshold = max(
-                LR_SENSITIVITY_DELTA / 10.0,
-                0.15 * abs(loss_after),
-            )
-            if delta < threshold:
+            if delta < LR_SENSITIVITY_DELTA:
                 r.warn(
                     "pattern:lr_insensitive",
                     f"lr changed but loss moved only {delta:.4f}"
-                    f" (threshold {threshold:.4f}, loss={loss_after:.4f})"
                     f" — model may be stuck",
                 )
             else:
                 r.ok(
                     f"pattern:lr_responsive"
-                    f"(delta={delta:.4f}, threshold={threshold:.4f})"
+                    f"(delta={delta:.4f})"
                 )
             break
 
@@ -628,8 +581,6 @@ def run_verification(
     embed_ctx:          str,
     pattern_tracker:    LearningPatternTracker,
     attn_mask:          torch.Tensor | None = None,
-    graph_reasoner:     nn.Module | None = None,
-    temporal_encoder:   nn.Module | None = None,
 ) -> VerifyReport:
     r = VerifyReport()
 
@@ -640,13 +591,6 @@ def run_verification(
         "cross_attn":         cross_attn,
         "text_proj":          text_proj,
     }
-    # Optional so older callers without a GAT / temporal encoder don't
-    # have to pass them; when present the grad-health checks cover
-    # those paths too.
-    if graph_reasoner is not None:
-        named_modules["graph_reasoner"] = graph_reasoner
-    if temporal_encoder is not None:
-        named_modules["temporal_encoder"] = temporal_encoder
 
     check_shapes(
         r, x_temporal, x_norm, x_fourier,

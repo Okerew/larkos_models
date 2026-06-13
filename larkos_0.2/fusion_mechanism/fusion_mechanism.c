@@ -20,33 +20,30 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* TEMPORARY 8N downscale for testing — see Documents/scaling.md */
 #define MAX_NEURONS 8
 #define MAX_CONNECTIONS 6
-#define INPUT_SIZE 6  // Size of the input tensor
+#define INPUT_SIZE 6 // Size of the input tensor
 #define MEMORY_VECTOR_SIZE (2 * MAX_NEURONS + INPUT_SIZE)
-/* NEURON_FIELDS / NEURON_STRIDE / MAX_NEURON_FLAT were used by the
- * removed neuron_flat -> nv pipeline; the GAT on the Python side now
- * carries the neuron view end-to-end, so they are intentionally absent
- * here. */
-#define MAX_MEM_ENTRIES 1200 // short + medium + long combined
+#define FUSION_DIM 64
+#define NEURON_FIELDS 4 // state, output, num_conn, layer_id
+#define NEURON_STRIDE (NEURON_FIELDS + MAX_CONNECTIONS * 2)
+#define MAX_NEURON_FLAT (MAX_NEURONS * NEURON_STRIDE)
+#define MAX_MEM_ENTRIES 300 // short + medium + long combined
 
 /* Top-K memory entries used in attention: softmax over all slots
  * with similar importances collapses to uniform weights and mv
  * becomes a noise average. We score first then only attend over the
  * K highest-scoring entries so mv carries signal. */
-#define MEM_TOP_K 32
+#define MEM_TOP_K 8
 
-/* The fused output is now carved into two contiguous bands: query and
- * memory. The neuron band (BAND_N) was removed when the Python-side
- * GAT took over neuron reasoning — the C-side projection of neuron
- * features into a flat band was redundant work whose output the
- * fusion head no longer consumed. The whole vector is layer-normed
- * and lightly cross-mixed so the transformer still sees interactions
- * between the two surviving bands. */
-#define BAND_Q 32 // llm query band  (TEMPORARY 8N; was 342)
-#define BAND_M 32 // memory band     (BAND_Q + BAND_M == FUSION_DIM)
-#define FUSION_DIM (BAND_Q + BAND_M) // 64 at 8N
+/* The fused output is carved into three contiguous, balanced bands
+ * so no stream can drown the others the way the old sigmoid gating
+ * let neuron/memory state bury the llm query. Each band is filled by
+ * its own stream then the whole vector is layer-normed and lightly
+ * cross-mixed so the transformer still sees interactions. */
+#define BAND_Q 22 // llm query band
+#define BAND_N 21 // neuron band
+#define BAND_M 21 // memory band  (BAND_Q + BAND_N + BAND_M == FUSION_DIM)
 
 static float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -201,17 +198,26 @@ void cognitive_fuse(const float *llm_embed, int llm_dim, const Neuron *neurons,
     layer_norm(q, FUSION_DIM);
   }
 
-  // 2. neuron view -- intentionally absent.
-  /* The Python-side _NeuronGraphReasoner now consumes the neuron graph
-   * directly (state, output, connections, weights) via GAT attention,
-   * so the previous neuron_flat -> project -> layer_norm pipeline that
-   * filled BAND_N is no longer needed. Removing it skips ~580k
-   * multiplies + one full FUSION_DIM layer_norm per forward and
-   * reclaims the BAND_N slot from the assembled `fused` vector. The
-   * `neurons` argument is still received because callers pass it for
-   * compatibility, but it is not read here anymore. */
-  (void)neurons;
-  (void)n_neurons;
+  // 2. neuron flat feature vector
+  /* [state, output, num_conn, layer_id, conn_0..5, w_0..5] per neuron;
+   * graph topology and edge weights give a richer structural picture
+   * than scalars alone */
+  float neuron_flat[MAX_NEURON_FLAT];
+  int nf = 0;
+  int neuron_count = n_neurons > 0 ? n_neurons : 0;
+  for (int i = 0; i < neuron_count && i < MAX_NEURONS; ++i) {
+    neuron_flat[nf++] = neurons[i].state;
+    neuron_flat[nf++] = neurons[i].output;
+    neuron_flat[nf++] = (float)neurons[i].num_connections;
+    neuron_flat[nf++] = (float)neurons[i].layer_id;
+    for (int c = 0; c < MAX_CONNECTIONS; ++c)
+      neuron_flat[nf++] = (float)neurons[i].connections[c];
+    for (int c = 0; c < MAX_CONNECTIONS; ++c)
+      neuron_flat[nf++] = neurons[i].weights[c];
+  }
+  float nv[FUSION_DIM];
+  project(neuron_flat, nf, nv);
+  layer_norm(nv, FUSION_DIM);
 
   // 3. top-K memory attention, llm query attends over memory
   /* Attending over all slots with similar importances collapses
@@ -280,16 +286,17 @@ void cognitive_fuse(const float *llm_embed, int llm_dim, const Neuron *neurons,
   }
 
   // 4. banded assembly
-  /* Each surviving stream is re-projected into its OWN contiguous band
-   * so the two never compete for the same coordinates. The neuron
-   * band was removed (see step 2) and BAND_M now follows directly
-   * after BAND_Q. The query owns BAND_Q dims outright; the memory
-   * stream owns BAND_M; the transformer downstream weights the bands
-   * however it learns to. Band seeds keep each band's projection
-   * distinct. */
+  /* Each stream is re-projected into its OWN contiguous band so the
+   * three never compete for the same coordinates. This is the core
+   * fix for the old behaviour where sigmoid gating let neuron/memory
+   * state bury the llm query at a fixed ~0.5 coefficient. Now the
+   * query owns BAND_Q dims outright; the transformer downstream can
+   * weight bands however it learns to. Band seeds keep each band's
+   * projection distinct. */
   float fused[FUSION_DIM];
-  project_band(q, FUSION_DIM, fused, 0,      BAND_Q, 1009u);
-  project_band(mv, FUSION_DIM, fused, BAND_Q, BAND_M, 3001u);
+  project_band(q, FUSION_DIM, fused, 0, BAND_Q, 1009u);
+  project_band(nv, FUSION_DIM, fused, BAND_Q, BAND_N, 2003u);
+  project_band(mv, FUSION_DIM, fused, BAND_Q + BAND_N, BAND_M, 3001u);
 
   // 5. context-modulated cross-band mixing
   /* The bands are independent after step 4, so we add a single light
