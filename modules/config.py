@@ -225,8 +225,8 @@ CHECKPOINT_VERSION = 1
 # fusion_mechanism.c. If those change in C these must change in lockstep.
 # BAND_N was removed when the GAT replaced the C-side neuron projection;
 # FUSION_DIM = BAND_Q + BAND_M.
-BAND_Q = 32
-BAND_M = 32
+BAND_Q = 22
+BAND_N = 21
 
 # Test-data domains
 TEST_DATA = "test_data"
