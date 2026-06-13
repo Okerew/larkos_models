@@ -124,7 +124,7 @@ stay within the `MODEL_INPUT_DIM` cap above.
 
 ### 2. `modules/fusion_mechanism/fusion_mechanism.c`
 - `FUSION_DIM` — must match `config.py`
-- `BAND_Q`, `BAND_N`, `BAND_M` — must sum to `FUSION_DIM`, update in lockstep with `_FusionTransformerHead._BAND_*` in `modules/training.py`
+- `BAND_Q`, `BAND_M` — must sum to `FUSION_DIM`, update in lockstep with `BAND_Q`/`BAND_M` in `modules/config.py`
 
 ### 3. `modules/config.py`
 - Same constants as in the include/definitions.h section
@@ -138,7 +138,7 @@ stay within the `MODEL_INPUT_DIM` cap above.
 - `D_MODEL`, `NHEAD`, `N_LAYERS`, `DIM_FF` — transformer size
 - `FUSION_DIM`, `FUSE_NHEAD`, `FUSE_DIM_FF` — fusion head size
 - `HIDDEN_DIM` — NeuralBlock hidden size
-- `BAND_Q/N/M`- must match C-side `BAND_*` values and sum to `FUSION_DIM`
+- `BAND_Q`, `BAND_M` — must match C-side values and sum to `FUSION_DIM` (`BAND_N` was retired when the GAT replaced the C-side neuron projection)
 - `MC_DROPOUT_T` — number of MC dropout forward passes per probe. Each
   one re-runs the encoder; drop to 4 on small GPUs.
 - `build_input_tensor()` — **EDIT THIS FUNCTION** when you change `INPUT_SIZE`/`MAX_NEURONS`. Must return an array of exactly `input_size` floats. The default emits 6 channels (mean state, mean output, activity spread, mean weight, temporal phase, memory churn) and zero-pads the rest.
@@ -186,9 +186,8 @@ Example: D_MODEL 64→256 (4×), N_LAYERS 2→4 (2×):
 | `NUM_HEADS` | 8 | 8 | 16 |
 | `HIDDEN_DIM` | 32 | 128 | 512 |
 | `PROJ_DIM` | 32 | 64 | 256 |
-| `BAND_Q` | 22 | 86 | 342 |
-| `BAND_N` | 21 | 85 | 341 |
-| `BAND_M` | 21 | 85 | 341 |
+| `BAND_Q` | 32 | 128 | 512 |
+| `BAND_M` | 32 | 128 | 512 |
 | `BASE_LR` | 0.01 | 0.002 | 0.0003 |
 | `MAML_INNER_LR` | 0.001 | 0.0003 | 0.00003 |
 | `FOURIER_ENCODINGS` | 4 | 4 | 4 |
@@ -198,7 +197,7 @@ Example: D_MODEL 64→256 (4×), N_LAYERS 2→4 (2×):
 
 Notes:
 
-- Sum of `BAND_*` must equal `FUSION_DIM`; adjust ±1 as needed.
+- `BAND_Q + BAND_M` must equal `FUSION_DIM`; split evenly (each = `FUSION_DIM / 2`).
 - `FOURIER_ENCODINGS` and `TEMPORAL_WINDOW` are **deliberately constant or
   even decreasing** across the columns — they belong to the feature
   extractor, not the model, and inflating them is what causes OOM on
