@@ -20,7 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* TEMPORARY 8N downscale for testing — see Documents/scaling.md */
 #define MAX_NEURONS 8
 #define MAX_CONNECTIONS 6
 #define INPUT_SIZE 6  // Size of the input tensor
