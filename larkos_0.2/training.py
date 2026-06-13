@@ -1,6 +1,5 @@
 import copy
 import ctypes
-import math
 from pathlib import Path
 import numpy as np
 import torch
@@ -15,12 +14,10 @@ from modules.config import (
     MEM_WEIGHT_RATIO_BASE, MEM_WEIGHT_RATIO_RANGE,
     FOURIER_ENCODINGS, TEMPORAL_WINDOW, FOURIER_OUT_DIM,
     FUSION_DIM, MC_DROPOUT_T, EXPLORE_THRESHOLD,
-    INTERNAL_DIM, GPT2_HIDDEN, TEXT_MAX_NEW,
+    INTERNAL_DIM, FUSE_NHEAD, FUSE_N_LAYER, FUSE_DIM_FF,
+    GPT2_HIDDEN, TEXT_MAX_NEW,
     VERIFY_INTERVAL, TARGET_FREEZE_INTERVAL,
-    EMOTION_LOG_INTERVAL, N_PREFIX, BAND_M, BAND_Q,
-    FUSE_GRAPH_DMODEL, FUSE_GRAPH_NHEAD, FUSE_GRAPH_LAYERS,
-    FUSE_GRAPH_DIM_FF, GAT_HEADS, GAT_LAYERS, MAX_CONNECTIONS,
-    TEMPORAL_NHEAD, TEMPORAL_LAYERS, TEMPORAL_DIM_FF, D_NODE
+    EMOTION_LOG_INTERVAL, N_PREFIX, BAND_M, BAND_Q, BAND_N
 )
 from modules.model import LarkosModel, EMAWrapper
 from modules.strategies import (
@@ -323,409 +320,67 @@ class _OnlineMinMax:
         return scaled.clamp(-3.0, 3.0)
 
 
-class _GATLayer(nn.Module):
-    """
-    Single hand-rolled GAT layer over a dense [N, N] adjacency mask.
-
-    The Larkos neuron graph has N=MAX_NEURONS=128 nodes and at most 32
-    real edges per neuron, plus a self-loop. That is small enough to
-    run attention with a full [N, N] mask instead of scatter ops, which
-    keeps the implementation aligned with the rest of the file's
-    hand-rolled style and avoids a torch_geometric dependency.
-
-    Per head, the unnormalised attention score follows the original GAT
-    formulation:
-
-        e_ij = LeakyReLU(a_src . W h_i + a_dst . W h_j)
-
-    Edge weights from the C-side `weights[]` array modulate the score
-    multiplicatively via a tanh-squashed gain, so a strong edge raises
-    its softmax mass without being able to dominate the LeakyReLU sign.
-    Non-edges are masked to -inf before softmax.
-    """
-
-    def __init__(self, d_in: int, d_out: int, n_heads: int) -> None:
-        super().__init__()
-        assert d_out % n_heads == 0, (
-            "GAT d_out must be divisible by n_heads"
-        )
-        self.n_heads  = n_heads
-        self.head_dim = d_out // n_heads
-
-        # Per-head linear projection of node features. Bias-free so the
-        # zero-padded features of unused neurons stay at zero rather
-        # than getting a constant bias that would leak through softmax.
-        self.W = nn.Linear(d_in, n_heads * self.head_dim, bias=False)
-
-        # GAT-style attention vectors split into source / destination
-        # halves, equivalent to a^T [Wh_i || Wh_j] but cheaper.
-        self.a_src = nn.Parameter(
-            torch.randn(n_heads, self.head_dim) / math.sqrt(self.head_dim)
-        )
-        self.a_dst = nn.Parameter(
-            torch.randn(n_heads, self.head_dim) / math.sqrt(self.head_dim)
-        )
-
-        self.leaky = nn.LeakyReLU(0.2)
-
-    def forward(
-        self,
-        h:           torch.Tensor,
-        adj_mask:    torch.Tensor,
-        edge_weight: torch.Tensor,
-    ) -> torch.Tensor:
-        # h           : [B, N, d_in]
-        # adj_mask    : [N, N] bool (True on edge, including self-loops)
-        # edge_weight : [N, N] float
-        # returns     : [B, N, n_heads * head_dim]
-        B, N, _ = h.shape
-
-        h_proj = self.W(h).view(
-            B, N, self.n_heads, self.head_dim
-        )  # [B, N, H, d_head]
-
-        # alpha_src[b, i, h] = a_src[h] . h_proj[b, i, h]
-        alpha_src = (
-            h_proj * self.a_src.view(1, 1, self.n_heads, self.head_dim)
-        ).sum(dim=-1)  # [B, N, H]
-        alpha_dst = (
-            h_proj * self.a_dst.view(1, 1, self.n_heads, self.head_dim)
-        ).sum(dim=-1)  # [B, N, H]
-
-        # scores[b, h, i, j] = leaky(alpha_src[b, i, h] + alpha_dst[b, j, h])
-        scores = self.leaky(
-            alpha_src.permute(0, 2, 1).unsqueeze(-1)
-            + alpha_dst.permute(0, 2, 1).unsqueeze(-2)
-        )  # [B, H, N, N]
-
-        mask = adj_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
-        scores = scores.masked_fill(~mask, float("-inf"))
-
-        # Edge-weight gain: tanh-squashed so a single huge weight cannot
-        # explode the softmax; the +1 keeps self-loops (where weight=1)
-        # at their unscaled score.
-        ew = torch.tanh(edge_weight).unsqueeze(0).unsqueeze(0)
-        scores = scores * (1.0 + ew)
-
-        attn = torch.softmax(scores, dim=-1)  # [B, H, N, N]
-
-        # h_for_agg : [B, H, N, d_head]
-        h_for_agg = h_proj.permute(0, 2, 1, 3)
-        out = torch.matmul(attn, h_for_agg)  # [B, H, N, d_head]
-        out = (
-            out.permute(0, 2, 1, 3)
-                .contiguous()
-                .view(B, N, self.n_heads * self.head_dim)
-        )
-        return out
-
-
-class _TemporalAttentionEncoder(nn.Module):
-    """
-    Tiny temporal-axis transformer encoder that runs over the
-    [TEMPORAL_WINDOW, FOURIER_OUT_DIM] input history before it is
-    flattened for LarkosModel. Without this layer the history is
-    `torch.cat`ed into a flat vector, leaving the model to infer
-    temporal position from slot offset — there is no positional /
-    temporal embedding anywhere downstream.
-
-    Output shape matches the input ([TEMPORAL_WINDOW, FOURIER_OUT_DIM])
-    so the existing flatten-then-NumericTokenizer path is unchanged;
-    only the values inside the sequence have been attended across
-    timesteps. Pooling would destroy the per-timestep granularity
-    NumericTokenizer is built to consume, so we keep the full
-    sequence and let LarkosModel's own input transformer continue to
-    mix across (time x feature) jointly.
-
-    The learned positional vector lets the model carve out "current
-    frame" vs "older frames" without baking in any prior about how
-    time should be encoded; with seq_len=TEMPORAL_WINDOW=6 it costs
-    ~1.5k parameters — negligible.
-    """
-
-    def __init__(
-        self,
-        seq_len:  int = TEMPORAL_WINDOW,
-        d_model:  int = FOURIER_OUT_DIM,
-        nhead:    int = TEMPORAL_NHEAD,
-        n_layers: int = TEMPORAL_LAYERS,
-        dim_ff:   int = TEMPORAL_DIM_FF,
-        dropout:  float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.pos = nn.Parameter(torch.zeros(seq_len, d_model))
-        nn.init.normal_(self.pos, std=0.02)
-
-        self.input_norm = nn.LayerNorm(d_model)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model         = d_model,
-            nhead           = nhead,
-            dim_feedforward = dim_ff,
-            dropout         = dropout,
-            batch_first     = True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            enc_layer, num_layers=n_layers,
-        )
-
-    def forward(self, x_seq: torch.Tensor) -> torch.Tensor:
-        # x_seq : [TEMPORAL_WINDOW, FOURIER_OUT_DIM]  (no batch dim)
-        # returns same shape, attended across timesteps.
-        seq = x_seq + self.pos                 # add temporal positional embed
-        seq = self.input_norm(seq)
-        # nn.TransformerEncoder expects [B, L, D] when batch_first=True
-        return self.encoder(seq.unsqueeze(0)).squeeze(0)
-
-
-class _NeuronGraphReasoner(nn.Module):
-    """
-    Graph attention over the live neuron graph exposed by
-    backend_state.get_neurons(). Produces per-neuron embeddings that
-    feed the refactored _FusionTransformerHead as a token sequence,
-    carrying the neuron view end-to-end. The C-side BAND_N pipeline
-    that the head used to consume has been retired from
-    cognitive_fuse.
-
-    Node features per neuron: state, output, layer one-hot (2 dims),
-    and a tanh-squashed connection-degree signal. Edges and edge
-    weights come straight from `connections[]` / `weights[]` in the
-    neurons dict. Self-loops are always added so an isolated neuron
-    still updates from itself rather than getting -inf attention.
-
-    Two GAT layers with a residual + LayerNorm between them. The
-    graph topology is fixed at backend init today (sparse, 2 edges per
-    neuron) but the C side is free to mutate it; we rebuild the adj
-    mask on every forward so the layer always sees the current graph.
-    """
-
-    # Per-node feature layout (8 dims):
-    #   0  state
-    #   1  output
-    #   2  layer one-hot id==0
-    #   3  layer one-hot id==1
-    #   4  tanh(num_connections / MAX_CONNECTIONS)
-    #   5  state - prev_state    (per-neuron velocity since last refresh)
-    #   6  |output|              (output magnitude)
-    #   7  tanh(mean outgoing edge weight)
-    # On top of these, the forward adds a learned per-neuron embedding
-    # of size d_out so identical static features at different neuron
-    # indices still get distinct token representations — the GAT alone
-    # cannot distinguish two symmetric nodes otherwise.
-    _D_NODE = D_NODE
-
-    def __init__(
-        self,
-        d_out:    int = FUSE_GRAPH_DMODEL,
-        n_heads:  int = GAT_HEADS,
-        n_layers: int = GAT_LAYERS,
-    ) -> None:
-        super().__init__()
-        self.node_in = nn.Linear(self._D_NODE, d_out)
-
-        # Learned per-neuron embedding. Added to the projected node
-        # features so symmetric neurons (same static features) still
-        # produce distinct tokens. Init std matches the rest of the
-        # file's learned embeddings.
-        self.neuron_embed = nn.Parameter(torch.zeros(MAX_NEURONS, d_out))
-        nn.init.normal_(self.neuron_embed, std=0.02)
-
-        self.layers  = nn.ModuleList([
-            _GATLayer(d_out, d_out, n_heads)
-            for _ in range(n_layers)
-        ])
-        self.norms = nn.ModuleList([
-            nn.LayerNorm(d_out) for _ in range(n_layers)
-        ])
-        self.act = nn.ELU()
-
-        # Transient buffer for per-neuron state velocity. Not saved in
-        # the checkpoint (persistent=False) — it is recomputable state,
-        # not a learned parameter, and on resume we'd rather start from
-        # zero velocity than carry a stale snapshot from a different
-        # backend session.
-        self.register_buffer(
-            "_prev_states",
-            torch.zeros(MAX_NEURONS),
-            persistent=False,
-        )
-
-    def build_graph_inputs(
-        self,
-        neurons: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Built on CPU; the caller moves them to DEVICE alongside the
-        # rest of the forward inputs. Plain-python reads from the
-        # `neurons` dict — `get_neurons()` already pulled them across
-        # the C boundary, so this loop is cheap (~MAX_NEURONS dict
-        # lookups).
-        #
-        # Updates `_prev_states` as a side effect so the next call's
-        # state_delta is a real per-neuron velocity rather than always
-        # measuring from zero. Callers using the freeze cache should
-        # invoke this only when they actually want a fresh read — the
-        # freeze cache stores the returned tensors and re-uses them
-        # across the window, so prev_states moves forward exactly once
-        # per target refresh (every TARGET_FREEZE_INTERVAL epochs).
-        N = MAX_NEURONS
-        node_features = torch.zeros(N, self._D_NODE)
-        adj_mask      = torch.eye(N, dtype=torch.bool)  # self-loops
-        edge_weight   = torch.zeros(N, N)
-        cur_states    = torch.zeros(N)
-
-        prev_states = self._prev_states.detach().to("cpu")
-
-        for i in range(N):
-            neuron = neurons.get(f"neuron_{i}", {})
-            state    = float(neuron.get("state",  0.0))
-            output   = float(neuron.get("output", 0.0))
-            layer_id = int(neuron.get("layer_id", 0))
-            num_conn = int(neuron.get("num_connections", 0))
-            conns    = neuron.get("connections", []) or []
-            ws       = neuron.get("weights",     []) or []
-
-            cur_states[i] = state
-
-            node_features[i, 0] = state
-            node_features[i, 1] = output
-            # Two-class one-hot covers layer_id in {0, 1}; if the C
-            # side ever grows more layers this still degrades to all
-            # zeros for the extra ones, which is benign.
-            node_features[i, 2] = 1.0 if layer_id == 0 else 0.0
-            node_features[i, 3] = 1.0 if layer_id == 1 else 0.0
-            node_features[i, 4] = math.tanh(
-                num_conn / float(MAX_CONNECTIONS)
-            )
-            node_features[i, 5] = state - float(prev_states[i])
-            node_features[i, 6] = abs(output)
-
-            edge_weight[i, i] = 1.0
-
-            usable = min(num_conn, MAX_CONNECTIONS, len(conns))
-            w_sum: float = 0.0
-            w_count: int = 0
-            for slot in range(usable):
-                j = int(conns[slot])
-                if 0 <= j < N:
-                    adj_mask[i, j] = True
-                    if slot < len(ws):
-                        w = float(ws[slot])
-                        edge_weight[i, j] = w
-                        w_sum   += w
-                        w_count += 1
-            mean_w = (w_sum / w_count) if w_count > 0 else 0.0
-            node_features[i, 7] = math.tanh(mean_w)
-
-        # Advance velocity reference. Detach so the buffer never carries
-        # an autograd dependency.
-        self._prev_states.copy_(cur_states.detach())
-
-        return node_features, adj_mask, edge_weight
-
-    def forward_from_inputs(
-        self,
-        node_features: torch.Tensor,
-        adj_mask:      torch.Tensor,
-        edge_weight:   torch.Tensor,
-    ) -> torch.Tensor:
-        # Runs the in-graph half of the reasoner (projection + GAT
-        # layers) on pre-built features. Split out from `forward` so
-        # the training freeze cache can pin the *inputs* to the GAT
-        # while still running the GAT in-graph on every step — this
-        # keeps gradient flowing to GAT params during a freeze window
-        # without re-reading live neuron state.
-        node_features = node_features.to(DEVICE)
-        adj_mask      = adj_mask.to(DEVICE)
-        edge_weight   = edge_weight.to(DEVICE)
-
-        h = self.node_in(node_features).unsqueeze(0)        # [1, N, d_out]
-        h = h + self.neuron_embed.unsqueeze(0)              # per-neuron embed
-        for layer, norm in zip(self.layers, self.norms):
-            h_new = self.act(layer(h, adj_mask, edge_weight))
-            h     = norm(h + h_new)                         # residual + post-norm
-        return h
-
-    def forward(self, neurons: dict) -> torch.Tensor:
-        # Convenience path: build inputs from a fresh neurons dict and
-        # run the GAT in one go. Returns [1, MAX_NEURONS, d_out]. The
-        # training loop bypasses this and calls build_graph_inputs /
-        # forward_from_inputs separately so it can cache the inputs.
-        node_features, adj_mask, edge_weight = self.build_graph_inputs(
-            neurons
-        )
-        return self.forward_from_inputs(
-            node_features, adj_mask, edge_weight,
-        )
-
-
 class _FusionTransformerHead(nn.Module):
     """
-    Refactored fusion head: instead of attending over 3 stream tokens
-    (Q / N / M) at FUSION_DIM and mean-pooling, this attends over a
-    mixed sequence of per-neuron graph-attention tokens plus a handful
-    of context tokens, then attention-pools.
+    Sits on top of cognitive_fuse. The C side writes three distinct
+    contiguous bands into the FUSION_DIM vector:
 
-    Sequence layout (length MAX_NEURONS + 3):
-        - [0 : MAX_NEURONS)        per-neuron tokens from _NeuronGraphReasoner
-        - [MAX_NEURONS]            band_q from cognitive_fuse  (LLM query stream)
-        - [MAX_NEURONS + 1]        band_m from cognitive_fuse  (memory stream)
-        - [MAX_NEURONS + 2]        driver embedding (llm_embed_ca)
+        [0           : BAND_Q)            -> llm query stream
+        [BAND_Q      : BAND_Q+BAND_N)     -> neuron stream
+        [BAND_Q+BAND_N : FUSION_DIM)      -> memory stream
 
-    BAND_N has been retired on the C side too — its information is
-    now carried by the per-neuron GAT tokens, which preserve the graph
-    topology the C-side projection used to collapse into 341 dims. Q
-    and M still flow in because cognitive_fuse mixes them with
-    text_embed / memory attention that the GAT does not see.
+    We treat those bands as a length-3 token sequence so the encoder's
+    self-attention can learn how much each stream should attend to the
+    others. 
 
-    Token-type embedding (4 ids: graph, q, m, driver) lets the encoder
-    distinguish which kind of token it is attending to without giving
-    every neuron an individual positional embedding (their identity is
-    implicit in the graph structure the GAT already attended over).
+    Bands are unequal length (22/21/21) but a transformer needs a
+    uniform d_model per token, so each band gets its own learned input
+    projection into d_model, plus a learned stream-type embedding so
+    attention can tell which token is which stream.
 
-    Pool is a single learned query attending over the full sequence —
-    a softmax over the 131 tokens, then a weighted sum back to d_model.
-    Replaces the old mean-pool, which gave every token equal voice
-    regardless of what the encoder learned.
-
-    `frozen_input` carries over from the old head: in-graph dropout +
-    noise are skipped on a frozen-target window so a pinned input does
-    not get regularised against a pinned target.
+    LayerNorm + input dropout + noise injection prevent the encoder
+    from memorising biased C-side fusion outputs; these are skipped on
+    a frozen-input window (see forward) where the input is identical
+    across the whole window and noise would only turn a fixed
+    learnable target into an unlearnable one.
     """
 
-    _TOK_GRAPH  = 0
-    _TOK_Q      = 1
-    _TOK_M      = 2
-    _TOK_DRIVER = 3
+    _BAND_Q = BAND_Q
+    _BAND_N = BAND_N
+    _BAND_M = BAND_M
 
     def __init__(
         self,
-        d_model:    int = FUSE_GRAPH_DMODEL,
-        nhead:      int = FUSE_GRAPH_NHEAD,
-        n_layers:   int = FUSE_GRAPH_LAYERS,
-        dim_ff:     int = FUSE_GRAPH_DIM_FF,
+        d_model:    int = FUSION_DIM,
+        nhead:      int = FUSE_NHEAD,
+        n_layers:   int = FUSE_N_LAYER,
+        dim_ff:     int = FUSE_DIM_FF,
         output_dim: int = MAX_NEURONS,
         dropout:    float = 0.1,
     ) -> None:
         super().__init__()
-        self.d_model = d_model
+        assert (
+            self._BAND_Q + self._BAND_N + self._BAND_M == FUSION_DIM
+        ), "band split must tile FUSION_DIM"
 
-        # Context-token projections. band_q / band_m come straight from
-        # cognitive_fuse's FUSION_DIM output; driver_in is the post
-        # cross-attention / text-proj embedding from the rest of
-        # _forward. Each gets its own linear so the attention can learn
-        # different mappings for different streams.
-        self.proj_q      = nn.Linear(BAND_Q, d_model)
-        self.proj_m      = nn.Linear(BAND_M, d_model)
-        self.proj_driver = nn.Linear(INTERNAL_DIM, d_model)
+        # One learned projection per stream maps its band into d_model.
+        # Separate projections (not a shared one) let each stream learn
+        # its own mapping since the bands carry different information.
+        self.proj_q = nn.Linear(self._BAND_Q, d_model)
+        self.proj_n = nn.Linear(self._BAND_N, d_model)
+        self.proj_m = nn.Linear(self._BAND_M, d_model)
 
-        # 4 token types: graph / q / m / driver. Shared across all 128
-        # graph tokens so the encoder treats them as a set, not a
-        # sequence with positions.
-        self.token_type_embed = nn.Parameter(torch.zeros(4, d_model))
-        nn.init.normal_(self.token_type_embed, std=0.02)
+        # Learned stream-type embedding (3 tokens, one per stream) so
+        # the attention can distinguish query / neuron / memory tokens.
+        # This is the sequence analogue of positional encoding but
+        # keyed on stream identity rather than position.
+        self.stream_embed = nn.Parameter(
+            torch.zeros(3, d_model)
+        )
+        nn.init.normal_(self.stream_embed, std=0.02)
 
-        self.input_norm    = nn.LayerNorm(d_model)
+        self.input_norm = nn.LayerNorm(d_model)
         self.input_dropout = nn.Dropout(dropout)
-
         enc_layer = nn.TransformerEncoderLayer(
             d_model         = d_model,
             nhead           = nhead,
@@ -736,72 +391,58 @@ class _FusionTransformerHead(nn.Module):
         self.encoder = nn.TransformerEncoder(
             enc_layer, num_layers=n_layers
         )
-
-        # Learned-query attention pool. Single query attends over the
-        # encoded sequence; the softmax over tokens replaces mean-pool.
-        self.pool_query = nn.Parameter(
-            torch.randn(d_model) / math.sqrt(d_model)
-        )
-
         self.linear_out = nn.Linear(d_model, output_dim)
 
-    @staticmethod
-    def split_band_q_m(
+    def _split_bands(
+        self,
         fused: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Helper for callers: slice band_q and band_m out of a raw
-        # cognitive_fuse output. The C side now writes only two
-        # contiguous bands ([0 : BAND_Q) and [BAND_Q : FUSION_DIM)),
-        # so the split is a clean halving of the fused vector.
-        return fused[:, :BAND_Q], fused[:, BAND_Q:]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # fused : (B, FUSION_DIM) -> three band slices matching fusion_mechanism.c
+        q_end = self._BAND_Q
+        n_end = self._BAND_Q + self._BAND_N
+        return (
+            fused[:, :q_end],
+            fused[:, q_end:n_end],
+            fused[:, n_end:],
+        )
 
     def forward(
         self,
-        graph_tokens: torch.Tensor,
-        band_q:       torch.Tensor,
-        band_m:       torch.Tensor,
-        driver:       torch.Tensor,
+        fused:        torch.Tensor,
         frozen_input: bool = False,
     ) -> torch.Tensor:
-        # graph_tokens : [B, MAX_NEURONS, d_model] (from _NeuronGraphReasoner)
-        # band_q       : [B, BAND_Q]
-        # band_m       : [B, BAND_M]
-        # driver       : [B, INTERNAL_DIM]
-        B = graph_tokens.shape[0]
+        band_q, band_n, band_m = self._split_bands(fused)
 
-        q_tok = self.proj_q(band_q).unsqueeze(1)        # [B, 1, d_model]
-        m_tok = self.proj_m(band_m).unsqueeze(1)        # [B, 1, d_model]
-        d_tok = self.proj_driver(driver).unsqueeze(1)   # [B, 1, d_model]
+        # Each band -> d_model, then stack into a length-3 sequence.
+        # tok : (B, 3, d_model)
+        tok_q = self.proj_q(band_q)
+        tok_n = self.proj_n(band_n)
+        tok_m = self.proj_m(band_m)
+        tok   = torch.stack([tok_q, tok_n, tok_m], dim=1)
 
-        type_g = self.token_type_embed[self._TOK_GRAPH].view(1, 1, -1)
-        type_q = self.token_type_embed[self._TOK_Q].view(1, 1, -1)
-        type_m = self.token_type_embed[self._TOK_M].view(1, 1, -1)
-        type_d = self.token_type_embed[self._TOK_DRIVER].view(1, 1, -1)
+        # Add the learned stream-type embedding so attention knows
+        # which token is which stream.
+        tok = tok + self.stream_embed.unsqueeze(0)
 
-        seq = torch.cat(
-            [
-                graph_tokens + type_g,
-                q_tok        + type_q,
-                m_tok        + type_m,
-                d_tok        + type_d,
-            ],
-            dim=1,
-        )  # [B, MAX_NEURONS + 3, d_model]
+        tok = self.input_norm(tok)
 
-        seq = self.input_norm(seq)
-
+        # On a frozen-input window the input is identical across the
+        # whole window, so dropout + noise just turn a fixed learnable
+        # target into a noisy unlearnable one. We skip both there and
+        # only regularise when the input is actually moving.
         if self.training and not frozen_input:
-            seq = self.input_dropout(seq)
-            seq = seq + torch.randn_like(seq) * 0.005
+            tok = self.input_dropout(tok)
+            tok = tok + torch.randn_like(tok) * 0.005
 
-        enc = self.encoder(seq)  # [B, L, d_model]
+        # Self-attention now runs over 3 real tokens, so it actually
+        # mixes the streams instead of collapsing to an MLP.
+        enc = self.encoder(tok)
 
-        # Learned-query attention pool: softmax over the sequence
-        # length, weighted sum back to d_model.
-        scores = (enc @ self.pool_query) / math.sqrt(self.d_model)
-        attn   = torch.softmax(scores, dim=-1)        # [B, L]
-        pooled = (attn.unsqueeze(-1) * enc).sum(dim=1)  # [B, d_model]
-
+        # Mean-pool the three stream tokens back to one vector. Pooling
+        # rather than taking a single token keeps all three streams in
+        # the output and lets the encoder decide their balance via the
+        # attention weights it learns.
+        pooled = enc.mean(dim=1)
         return self.linear_out(pooled)
 
 
@@ -1075,17 +716,6 @@ class TrainingLoop:
         # only copies the small trainable subset, not the ST encoder.
         self.fast_model = copy.deepcopy(self.model).to(DEVICE)
 
-        # Temporal encoder runs on the [TEMPORAL_WINDOW, FOURIER_OUT_DIM]
-        # input history before it is flattened for LarkosModel, giving
-        # the model an explicit temporal axis to attend over rather
-        # than letting time be implicit in slot offset.
-        self.temporal_encoder = _TemporalAttentionEncoder().to(DEVICE)
-
-        # Graph reasoner runs first: turns the live neuron graph into
-        # MAX_NEURONS tokens at FUSE_GRAPH_DMODEL. The fusion head then
-        # attends over those tokens plus a handful of context tokens.
-        self.graph_reasoner = _NeuronGraphReasoner().to(DEVICE)
-
         self.fusion_transformer = _FusionTransformerHead(
             output_dim=self.model.output_dim
         ).to(DEVICE)
@@ -1141,8 +771,6 @@ class TrainingLoop:
         self.optimizer = torch.optim.AdamW(
             list(self.model.parameters())
             + list(self.fusion_transformer.parameters())
-            + list(self.graph_reasoner.parameters())
-            + list(self.temporal_encoder.parameters())
             + list(self.embed_weight_net.parameters())
             + list(self.cross_attn.parameters())
             + list(self.text_proj.parameters())
@@ -1186,30 +814,6 @@ class TrainingLoop:
         # is the "loss that makes no sense" behaviour. We cache the raw
         # C-side fused vector and reuse it across the freeze window.
         self._cached_fused_cog: torch.Tensor | None = None
-
-        # Freeze-cache entry for the driver embedding. The refactored
-        # fusion head consumes the driver token directly from
-        # llm_embed_ca rather than going through the C side, so it was
-        # not implicitly pinned by the old _cached_fused_cog.
-        self._cached_driver: torch.Tensor | None = None
-
-        # Freeze-cache entry for the GAT inputs (node_features,
-        # adj_mask, edge_weight). Earlier 0.3 left graph_tokens out of
-        # the freeze cache entirely so the GAT could keep accumulating
-        # gradient during a freeze window, but that left the fusion
-        # head with a half-frozen / half-drifting input every epoch
-        # (Q+M+driver pinned, neuron tokens live) — exactly the kind
-        # of inconsistent input the freeze window was meant to avoid.
-        #
-        # We now pin the GAT *inputs* alongside the rest, and still
-        # run forward_from_inputs in-graph on every step. Result: the
-        # GAT continues to receive gradient on every frozen epoch
-        # (via its own params), but its inputs are pinned to the same
-        # snapshot as cognitive_fuse / driver, so the head sees a
-        # consistent input regime across the whole window.
-        self._cached_graph_inputs: tuple[
-            torch.Tensor, torch.Tensor, torch.Tensor
-        ] | None = None
 
         # Below this loss we stop stepping a frozen (input, target) pair
         # so we don't memorise it into a grad pulse. Tuned to sit just
@@ -1325,70 +929,30 @@ class TrainingLoop:
             text_embed       = self.text_encoding.detach(),
         )
 
-        # Freeze the heavy fusion-head inputs on the same window as the
-        # target. cognitive_fuse + the driver + the GAT inputs all
-        # evolve every epoch from upstream signals (live neurons / mem
-        # / model_pred); pinning the target while these drift is what
-        # made base_loss thrash. We pin them together and only let them
-        # move when the target is refreshed. The GAT itself still runs
-        # in-graph below so its params keep receiving gradient.
+        # Freeze the transformer input on the same window as the target.
+        # cognitive_fuse depends on live neurons / mem / llm_embed_ca so
+        # it moves every epoch; pinning the target while the input drifts
+        # is what made base_loss thrash. We pin both together and only
+        # let the input move when the target is refreshed.
         frozen_input = (
-            self._cached_fused_cog    is not None
-            and self._cached_driver       is not None
-            and self._cached_graph_inputs is not None
+            self._cached_fused_cog is not None
             and (epoch - self._target_epoch) < TARGET_FREEZE_INTERVAL
         )
         if frozen_input:
             fused_cog_for_tf = self._cached_fused_cog.to(DEVICE)
-            driver_for_tf    = self._cached_driver.to(DEVICE)
-            nf_for_gat, am_for_gat, ew_for_gat = (
-                self._cached_graph_inputs
-            )
         else:
             self._cached_fused_cog = fused_cog_raw.detach()
-            self._cached_driver    = llm_embed_ca.detach()
-            # Build the GAT inputs from live neurons exactly once per
-            # freeze window (here, at refresh). This also advances the
-            # reasoner's _prev_states buffer so per-neuron velocity is
-            # measured from refresh to refresh.
-            nf_for_gat, am_for_gat, ew_for_gat = (
-                self.graph_reasoner.build_graph_inputs(neurons)
-            )
-            self._cached_graph_inputs = (
-                nf_for_gat.detach(),
-                am_for_gat.detach(),
-                ew_for_gat.detach(),
-            )
             fused_cog_for_tf = fused_cog_raw
-            driver_for_tf    = llm_embed_ca
 
-        # Always run the GAT in-graph so its parameters keep receiving
-        # gradient on every step, including frozen epochs. Only the
-        # inputs are pinned during a freeze window.
-        graph_tokens_for_tf = self.graph_reasoner.forward_from_inputs(
-            nf_for_gat, am_for_gat, ew_for_gat,
-        )
-
-        # Re-center the C-side output before slicing bands so a stuck
-        # bias in any dimension doesn't get memorised into the transformer
-        # weights; the EMA norm update happens outside _forward (in
-        # run()) on the detached value to keep this clean.
+        # Re-center the C-side output before the fusion transformer
+        # so a stuck bias in any dimension doesn't get memorised into
+        # the transformer weights; the EMA norm update happens outside
+        # _forward (in run()) on the detached value to keep this clean
         fused_cog = self.fused_cog_norm.normalize(fused_cog_for_tf)
 
-        # Slice band_q / band_m out of the normalised fused vector;
-        # band_n is dropped — the graph tokens replace it.
-        band_q_in, band_m_in = self.fusion_transformer.split_band_q_m(
-            fused_cog.unsqueeze(0)
-        )
-
-        # fusion_transformer is fully in-graph. driver is 1D so add
-        # batch dim before passing.
+        # fusion_transformer is fully in-graph
         fused = self.fusion_transformer(
-            graph_tokens = graph_tokens_for_tf,
-            band_q       = band_q_in,
-            band_m       = band_m_in,
-            driver       = driver_for_tf.unsqueeze(0),
-            frozen_input = frozen_input,
+            fused_cog.unsqueeze(0), frozen_input=frozen_input
         )
 
         target = torch.tensor(
@@ -1396,26 +960,16 @@ class TrainingLoop:
         ).to(DEVICE).unsqueeze(0)
 
         # MAML inner loop on the persistent fast_model clone (built
-        # once in __init__, refreshed via param copy each epoch).
-        # We detach x_temporal here because MAML's inner loop calls
-        # loss.backward() inside maml_inner_update, which would
-        # otherwise walk back through the shared temporal_encoder /
-        # input pipeline graph and free its saved intermediates — the
-        # outer _backward would then hit "backward through the graph a
-        # second time". MAML is meant to fast-adapt the model itself,
-        # not the input pipeline, so detaching is also semantically
-        # correct: temporal_encoder still gets gradient via model_pred
-        # in the outer loss.
-        x_temporal_for_maml = x_temporal.detach().unsqueeze(0)
+        # once in __init__, refreshed via param copy each epoch)
         adapted   = maml_inner_update(
             self.model,
             self.fast_model,
-            x_temporal_for_maml,
+            x_temporal.unsqueeze(0),
             target,
             self.criterion,
             embed_ctx,
         )
-        maml_pred = adapted(x_temporal_for_maml, embed_ctx)
+        maml_pred = adapted(x_temporal.unsqueeze(0), embed_ctx)
         # NOTE: we do NOT fuse maml_pred with neuron_pred (the target)
         # here doing so would let target information leak into the
         # outer loss, letting the model appear to improve by relying
@@ -2010,22 +1564,9 @@ class TrainingLoop:
             padded = list(self.input_history)
             while len(padded) < TEMPORAL_WINDOW:
                 padded.insert(0, torch.zeros(FOURIER_OUT_DIM))
-            # Stack into [TEMPORAL_WINDOW, FOURIER_OUT_DIM] (a real
-            # sequence) so the temporal encoder can attend across time
-            # before we flatten for LarkosModel. The encoder output is
-            # the same shape, then reshape to [MODEL_INPUT_DIM] keeps
-            # the downstream contract identical.
-            x_seq_raw = torch.stack(
-                [t.to(DEVICE) for t in padded], dim=0
-            )                                              # [T, D]
-            # Stash the pre-encoder sequence for the verifier block so it
-            # can re-run temporal_encoder on a fresh graph; sharing the
-            # outer post-encoder x_temporal across _backward and the
-            # verifier triggers "backward through the graph a second
-            # time" because _backward already freed its saved tensors.
-            self._last_x_seq = x_seq_raw.detach()
-            x_seq = self.temporal_encoder(x_seq_raw)       # [T, D] in-graph
-            x_temporal = x_seq.reshape(-1)                 # [T * D]
+            x_temporal = torch.cat(
+                [t.to(DEVICE) for t in padded], dim=-1
+            )
 
             embed_ctx = _build_embed_ctx(ctx)
 
@@ -2092,15 +1633,11 @@ class TrainingLoop:
                 or (epoch - self._target_epoch) >= TARGET_FREEZE_INTERVAL):
                 self._cached_target = neuron_pred_live.copy()
                 self._target_epoch  = epoch
-                # Drop ALL fusion-head input caches so _forward takes
-                # a fresh reading on the same epoch the target refreshes
-                # — input and target move together, then both stay
-                # pinned for the rest of the window. The graph-input
-                # cache is dropped here too so the GAT input regime
-                # tracks fused_cog / driver exactly.
-                self._cached_fused_cog    = None
-                self._cached_driver       = None
-                self._cached_graph_inputs = None
+                # Drop the cached fused-cog input too so _forward takes
+                # a fresh C-side reading on the same epoch the target
+                # refreshes input and target move together, then both
+                # stay pinned for the rest of the window.
+                self._cached_fused_cog = None
             neuron_pred = self._cached_target
 
             # ---- forward ----
@@ -2136,20 +1673,8 @@ class TrainingLoop:
                 # first for a clean measurement.
                 self.optimizer.zero_grad()
                 with torch.enable_grad():
-                    # Re-run the temporal encoder on the cached raw
-                    # sequence so the verifier's _vp gets a fresh
-                    # autograd graph back to temporal_encoder. The
-                    # outer x_temporal's graph was already consumed by
-                    # _backward(fwd, epoch) above, so reusing it here
-                    # would trigger "backward through the graph a
-                    # second time" when check_gradients runs
-                    # loss.backward(retain_graph=True) on _vloss.
-                    _x_seq_v      = self.temporal_encoder(
-                        self._last_x_seq
-                    )
-                    _x_temporal_v = _x_seq_v.reshape(-1)
                     _vp    = self.model(
-                        _x_temporal_v.unsqueeze(0), embed_ctx
+                        x_temporal.unsqueeze(0), embed_ctx
                     )
                     _llm_embed_raw = _vp.squeeze(0)
                     _llm_embed = _llm_embed_raw[:INTERNAL_DIM]
@@ -2178,64 +1703,24 @@ class TrainingLoop:
                         text_embed       = self.text_encoding.detach(),
                     )
                     # Mirror training: inside a freeze window the
-                    # transformer was trained on the cached fused_cog,
-                    # driver, and GAT inputs — the verifier must probe
-                    # the same inputs or its reported loss describes a
-                    # path training never took.
+                    # transformer was trained on the cached input, so
+                    # the verifier must probe that same input or its
+                    # reported loss describes a path training never took
                     _vfrozen = (
-                        self._cached_fused_cog    is not None
-                        and self._cached_driver       is not None
-                        and self._cached_graph_inputs is not None
+                        self._cached_fused_cog is not None
                         and (epoch - self._target_epoch)
                         < TARGET_FREEZE_INTERVAL
                     )
                     if _vfrozen:
                         _fused_cog_v = self._cached_fused_cog.to(DEVICE)
-                        _driver_v    = self._cached_driver.to(DEVICE)
-                        _nf_v, _am_v, _ew_v = self._cached_graph_inputs
-                    else:
-                        _driver_v    = _llm_embed_ca_v
-                        # Training's _forward already built the GAT
-                        # inputs and populated the cache earlier in this
-                        # epoch, so we read straight from the cache
-                        # rather than calling build_graph_inputs again
-                        # (which would double-advance _prev_states).
-                        # The assertion above guards the empty-cache
-                        # window between init and the first _forward
-                        # call — _vfrozen handles the rest.
-                        assert self._cached_graph_inputs is not None, (
-                            "graph-input cache should have been "
-                            "populated by training _forward before the "
-                            "verifier runs"
-                        )
-                        _nf_v, _am_v, _ew_v = self._cached_graph_inputs
-
-                    # Graph reasoner output for the verifier — runs the
-                    # in-graph half on the same pinned inputs the head
-                    # was trained against, so _vbase carries a gradient
-                    # path back to graph_reasoner params on every step
-                    # (frozen or not).
-                    _graph_tokens_v = (
-                        self.graph_reasoner.forward_from_inputs(
-                            _nf_v, _am_v, _ew_v,
-                        )
-                    )
                     # Same re-centering as _forward so the verifier
                     # sees the identical normalised input
                     _fused_cog_v = self.fused_cog_norm.normalize(
                         _fused_cog_v
                     )
-                    _band_q_v, _band_m_v = (
-                        self.fusion_transformer.split_band_q_m(
-                            _fused_cog_v.unsqueeze(0)
-                        )
-                    )
                     _vf = self.fusion_transformer(
-                        graph_tokens = _graph_tokens_v,
-                        band_q       = _band_q_v,
-                        band_m       = _band_m_v,
-                        driver       = _driver_v.unsqueeze(0),
-                        frozen_input = _vfrozen,
+                        _fused_cog_v.unsqueeze(0),
+                        frozen_input=_vfrozen,
                     )
 
                     _neuron_pred_t = torch.tensor(
@@ -2280,8 +1765,6 @@ class TrainingLoop:
                     lr                 = backend_lr,
                     embed_ctx          = embed_ctx,
                     pattern_tracker    = self._pattern_tracker,
-                    graph_reasoner     = self.graph_reasoner,
-                    temporal_encoder   = self.temporal_encoder,
                 )
 
             # ---- side-effects (no grad) ----

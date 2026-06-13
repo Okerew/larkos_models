@@ -39,8 +39,9 @@ The Larkos system consists of two major components:
 \end{enumerate}
 
 Both components share the same core modules: the LarkosModel,
-\_FusionTransformerHead, embedding networks, and text codec. The key
-difference is that TrainingLoop computes gradients and updates weights,
+\texttt{\_TemporalAttentionEncoder}, \texttt{\_NeuronGraphReasoner},
+\texttt{\_FusionTransformerHead}, embedding networks, and text codec. The
+key difference is that TrainingLoop computes gradients and updates weights,
 while LarkosRunner only performs forward inference using frozen weights.
 
 \section{Core Mathematical Components}
@@ -112,19 +113,46 @@ where $\epsilon_f = 0.1$ (std floor).
 dividing by zero and blowing up. It keeps low-variance dimensions genuinely
 quiet rather than amplified by numerical instability.
 
-\subsection{Temporal Context Window}
+\subsection{Temporal Context Window and Encoder}
 
 The Fourier-encoded input is padded into a temporal window of size
-$\texttt{TEMPORAL\_WINDOW}$:
+$w = \texttt{TEMPORAL\_WINDOW} = 4$, forming a sequence:
 
 \[
-  x_{\text{temporal}} = \text{concat}(x_{t-w+1}, x_{t-w+2}, \ldots, x_t)
+  X_{\text{seq}} = [x_{t-w+1}, x_{t-w+2}, \ldots, x_t]
+  \in \mathbb{R}^{w \times \texttt{FOURIER\_OUT\_DIM}}
 \]
 
-where $w = \texttt{TEMPORAL\_WINDOW}$. Earlier positions are zero-padded.
+Earlier positions are zero-padded. The sequence is passed through
+\texttt{\_TemporalAttentionEncoder} before flattening:
 
-\textbf{Rationale}: Temporal history provides context for the model to
-detect trends and patterns over time, improving predictions.
+\[
+  X_{\text{enc}} = \text{TransformerEncoder}
+    \!\left(\text{LayerNorm}(X_{\text{seq}} + \mathbf{P}_{\text{pos}})\right)
+  \in \mathbb{R}^{w \times \texttt{FOURIER\_OUT\_DIM}}
+\]
+
+\[
+  x_{\text{temporal}} = \text{reshape}(X_{\text{enc}})
+  \in \mathbb{R}^{w \cdot \texttt{FOURIER\_OUT\_DIM}}
+\]
+
+where $\mathbf{P}_{\text{pos}} \in \mathbb{R}^{w \times d}$ is a learned
+positional embedding. The encoder uses $\texttt{TEMPORAL\_NHEAD}=4$ heads,
+$\texttt{TEMPORAL\_LAYERS}=2$ layers, and $\texttt{TEMPORAL\_DIM\_FF}=64$.
+The output shape is identical to a flat concatenation of the window frames,
+so the downstream \texttt{LarkosModel} contract is unchanged.
+
+\textbf{Rationale}: The encoder gives the model an explicit temporal axis
+to attend over. The learned positional vector lets the model distinguish
+the current frame from older frames. Without the encoder, temporal position
+is only implicit in the slot offset of the flat vector.
+
+\textbf{Gradient note}: \texttt{temporal\_encoder} is listed in
+\texttt{DETACHED\_LABELS} because chain-rule attenuation through many
+layers puts its gradient norm structurally orders of magnitude below the
+fusion head. Dead-module and oscillation checks still apply; only the
+head-vs-module balance ratio is skipped.
 
 \subsection{LarkosModel Internals}
 
@@ -153,13 +181,6 @@ embedding table $E \in \mathbb{R}^{V \times d_{\text{model}}}$:
 
 producing a sequence $(t_1, \ldots, t_D)$ that the encoder attends
 over.
-
-\textbf{No pre-quantisation projection}: An earlier version applied a
-learnable $\mathbb{R}^{D \times D}$ Linear before the soft assignment.
-It was removed because the per-prototype softmax already gives every
-input dimension its own learnable mapping into the embedding space,
-making the rotation redundant — and free of the $\sim 37$k parameters
-it cost.
 
 \subsubsection{EmbeddingProjector (Context Stream)}
 
@@ -311,75 +332,140 @@ provides the gradient signal for the modules before the C boundary.
 \subsubsection{Frozen Input Windows}
 
 Training targets are refreshed every $\texttt{TARGET\_FREEZE\_INTERVAL}$
-epochs. Between refreshes, both the cached target and cached fused
-cognitive vector are held constant:
+epochs. Between refreshes, the target and all fusion-head inputs are held
+constant:
 
 \[
-  \text{frozen\_input} = \text{(cache exists)} \land
-    \text{(epoch} - \text{target\_epoch)} < \text{INTERVAL}
+  \text{frozen\_input} =
+    (\texttt{\_cached\_fused\_cog} \neq \text{None})
+    \land (\texttt{\_cached\_driver} \neq \text{None})
+    \land (\texttt{\_cached\_graph\_inputs} \neq \text{None})
+    \land (\text{epoch} - \text{target\_epoch}) < \text{INTERVAL}
 \]
 
-\textbf{Rationale}: If the target is fixed but the transformer input
-drifts, the model chases a moving input toward a fixed point, producing
-unstable loss. Pinning both together and refreshing them synchronously
-prevents this pathology. The frozen window allows the model to converge
-on the pair without the input changing underneath it.
+Three caches are maintained:
+\begin{itemize}
+  \item \texttt{\_cached\_fused\_cog}: the normalised C-side fused vector
+  \item \texttt{\_cached\_driver}: the \texttt{llm\_embed\_ca} driver
+    embedding
+  \item \texttt{\_cached\_graph\_inputs}: the raw GAT inputs
+    (node\_features, adj\_mask, edge\_weight) — pinned so the fusion head
+    sees a consistent neuron snapshot; the GAT itself still runs
+    \texttt{forward\_from\_inputs} in-graph on every step so its
+    parameters receive gradient throughout the window
+\end{itemize}
+
+All three caches are invalidated together whenever the target is refreshed,
+so input and target always move in lockstep.
+
+\textbf{Rationale}: Pinning the inputs and target on the same refresh
+schedule prevents the model from chasing a moving input toward a fixed
+target, which produces unstable loss. The GAT inputs are pinned at the
+C-side boundary, not at the GAT output, so the GAT parameters keep
+receiving gradient on every frozen epoch.
+
+\subsection{Neuron Graph Reasoner}
+
+Before the fusion head, the live neuron graph is processed by
+\texttt{\_NeuronGraphReasoner}, producing per-neuron token embeddings:
+
+\[
+  \mathbf{H}_{\text{graph}} \in
+    \mathbb{R}^{1 \times \text{MAX\_NEURONS} \times d_{\text{gat}}}
+\]
+
+Each node's 8-dimensional feature vector ($D_{\text{node}} = 8$)
+consists of: state, output, layer one-hot (2 dims), tanh-squashed
+connection degree, per-neuron state velocity $(\Delta\text{state})$,
+output magnitude, and mean outgoing edge weight. A learned per-neuron
+embedding $\mathbf{E}_{\text{neuron}} \in
+\mathbb{R}^{\text{MAX\_NEURONS} \times d}$ is added so nodes with
+identical static features still produce distinct tokens.
+
+Each \texttt{\_GATLayer} computes multi-head attention scores using the
+GAT formulation:
+\[
+  e_{ij} = \text{LeakyReLU}\!\left(
+    \mathbf{a}_{\text{src}}^\top W h_i +
+    \mathbf{a}_{\text{dst}}^\top W h_j
+  \right) \cdot (1 + \tanh(w_{ij}))
+\]
+
+where $w_{ij}$ is the C-side edge weight. Non-edges are masked to
+$-\infty$ before softmax. Self-loops are always present so an isolated
+neuron updates from itself. Two GAT layers ($\texttt{GAT\_HEADS}=2$,
+$\texttt{GAT\_LAYERS}=2$) with a residual + post-LayerNorm connect them.
+
+The reasoner exposes two entry points:
+\begin{itemize}
+  \item \texttt{build\_graph\_inputs(neurons)}: constructs node features,
+    adjacency mask, and edge weight matrix from the live neurons dict.
+    Also advances the \texttt{\_prev\_states} buffer for state-velocity
+    computation.
+  \item \texttt{forward\_from\_inputs(nf, am, ew)}: runs the in-graph
+    projection and GAT layers on pre-built features. Used by the training
+    loop so the GAT input can be cached while the GAT itself remains
+    in-graph.
+\end{itemize}
 
 \subsection{Fusion Transformer Head}
 
-The \_FusionTransformerHead treats the fused cognitive vector as three
-contiguous bands that form a 3-token sequence:
+The \texttt{\_FusionTransformerHead} attends over a mixed token sequence
+of length $\text{MAX\_NEURONS} + 3$:
+
+\begin{itemize}
+  \item $[\,0 : \text{MAX\_NEURONS})$ — per-neuron tokens from
+    \texttt{\_NeuronGraphReasoner}
+  \item $[\text{MAX\_NEURONS}]$ — band\_q token (LLM query band,
+    $\text{BAND\_Q}=32$ dims projected to $d_{\text{model}}$)
+  \item $[\text{MAX\_NEURONS}+1]$ — band\_m token (memory band,
+    $\text{BAND\_M}=32$ dims projected to $d_{\text{model}}$)
+  \item $[\text{MAX\_NEURONS}+2]$ — driver token (\texttt{llm\_embed\_ca},
+    \texttt{INTERNAL\_DIM} dims projected to $d_{\text{model}}$)
+\end{itemize}
+
+Token-type embeddings (4 types: graph / q / m / driver) let the encoder
+distinguish token kinds without individual positional indices for the 128
+graph tokens:
 
 \[
-  \text{Band 0} = \text{fused}[0:\text{BAND\_Q}] \quad (\text{LLM query
-    stream})
+  \text{seq} = \bigl[\mathbf{H}_{\text{graph}} + \mathbf{e}_{\text{graph}},\;
+    \mathbf{q}_{\text{tok}} + \mathbf{e}_q,\;
+    \mathbf{m}_{\text{tok}} + \mathbf{e}_m,\;
+    \mathbf{d}_{\text{tok}} + \mathbf{e}_d\bigr]
+\]
+
+A 3-layer encoder ($d_{\text{model}}=64$, 4 heads, $d_{\text{ff}}=128$)
+attends over the sequence. Output is pooled by a \emph{learned-query
+attention pool}:
+
+\[
+  \text{scores} = \frac{\text{enc} \cdot \mathbf{q}_{\text{pool}}}
+    {\sqrt{d_{\text{model}}}}
+  \quad,\quad
+  \text{pooled} = \sum_i \text{softmax}(\text{scores})_i \cdot
+    \text{enc}_i
 \]
 
 \[
-  \text{Band 1} = \text{fused}[\text{BAND\_Q}:\text{BAND\_Q+BAND\_N}]
-    \quad (\text{neuron stream})
+  \text{output} = \text{LinearOut}(\text{pooled})
+    \in \mathbb{R}^{\text{MAX\_NEURONS}}
 \]
 
-\[
-  \text{Band 2} = \text{fused}[\text{BAND\_Q+BAND\_N}:]
-    \quad (\text{memory stream})
-\]
+\textbf{Why learned-query pooling}: A softmax over the 131-token sequence
+lets the pooling step learn to up-weight informative tokens rather than
+giving every token equal voice.
 
-Each band is projected into a shared $d_{\text{model}}$ space:
-
-\[
-  \text{tok}_i = \text{proj}_i(\text{Band}_i) + \text{stream\_embed}_{i}
-\]
-
-A transformer encoder runs self-attention over the 3 tokens:
-
-\[
-  \text{enc} = \text{TransformerEncoder}([\text{tok}_{0}, \text{tok}_{1},
-    \text{tok}_{2}])
-\]
-
-Output is mean-pooled and projected to neuron dimensions:
-
-\[
-  \text{fused} = \text{LinearOut}\left(
-    \frac{1}{3} \sum_{i} \text{enc}_{i} \right)
-\]
-
-\textbf{Why Three Bands}: The bands carry different semantic information
-(LLM query, neuron state, memory). Using separate projections and stream
-embeddings lets each stream learn its own mapping and lets attention
-determine their balance.
-
-\textbf{Mean Pooling}: Pooling instead of taking a single token keeps all
-three streams in the output. Attention learns to weight each stream
-appropriately rather than collapsing to one.
+\textbf{Frozen-input}: In-graph dropout and noise are skipped on a
+frozen-window epoch so a pinned input is not regularised against a pinned
+target.
 
 \subsection{MAML Inner Loop}
 
-The outer-loss term ($L_{\text{outer}}$, defined below) is computed
-against a \emph{fast clone} adapted to the current task with a few
-inner SGD steps. The clone is built once, at \texttt{TrainingLoop}
-initialisation, via \texttt{copy.deepcopy(self.model)} — the
+The outer-loss term ($L_{\text{outer}}$) is computed against a
+\emph{fast clone} adapted to the current task with a few inner SGD steps.
+The clone is built once, at \texttt{TrainingLoop} initialisation, via
+\texttt{copy.deepcopy(self.model)} — the
 \texttt{EmbeddingProjector.\_\_deepcopy\_\_} override ensures the
 $\sim 22$M frozen ST parameters are shared, not duplicated.
 
@@ -396,11 +482,18 @@ $L = \text{MSE}(\text{fast}(x, c), \text{target})$ with
 $\text{lr} = \text{MAML\_INNER\_LR}$. The adapted clone is returned
 and a single forward pass produces $\text{maml\_pred}$.
 
-\textbf{Why a persistent fast clone}: The previous implementation
-re-ran \texttt{copy.deepcopy(model)} inside every inner update — that
-traversed the entire model tree (including the frozen MiniLM) per
-epoch. The persistent clone reduces the per-epoch cost to the
-in-place copy of the small trainable subset.
+\textbf{MAML detach}: \texttt{x\_temporal} is detached before the inner
+loop. MAML's inner \texttt{loss.backward()} would otherwise walk back
+through the shared temporal encoder graph and free its saved intermediates
+before the outer \texttt{\_backward} can use them. Detaching is also
+semantically correct: MAML fast-adapts the model, not the input pipeline.
+The temporal encoder still receives gradient via \texttt{model\_pred} in
+the outer loss.
+
+\textbf{Why a persistent fast clone}: Re-running \texttt{copy.deepcopy}
+inside every inner update traverses the entire model tree (including the
+frozen MiniLM) per epoch. The persistent clone reduces the per-epoch cost
+to the in-place copy of the small trainable subset.
 
 \subsection{Loss Computation}
 
@@ -605,20 +698,23 @@ decaying instead of being pinned high.
 
 \subsection{Initialization and Loading}
 
-LarkosRunner reconstructs only forward-path modules and loads trained
-weights via \texttt{load\_checkpoint}:
+LarkosRunner reconstructs all forward-path modules in the same order as
+TrainingLoop so \texttt{load\_checkpoint} can restore onto matching
+attribute names without special-casing:
 
 \[
-  \text{Runner} = \text{LarkosRunner}(\text{backend}, \text{ckpt\_path})
+  \texttt{temporal\_encoder},\;
+  \texttt{graph\_reasoner},\;
+  \texttt{fusion\_transformer},\;
+  \texttt{embed\_weight\_net},\;
+  \texttt{cross\_attn},\;
+  \texttt{text\_proj}
 \]
 
 The C-side backend is reloaded with saved memory and network states:
 
 \[
-  \text{backend.load\_memory()}
-\]
-
-\[
+  \text{backend.load\_memory()}, \quad
   \text{backend.load\_network\_states()}
 \]
 
@@ -626,6 +722,32 @@ The C-side backend is reloaded with saved memory and network states:
 would see empty neurons and memory, and the readout would not reflect
 training dynamics. Both halves (PyTorch weights + C-side state) are needed
 together; neither is usable alone.
+
+\subsection{Backend Advance}
+
+Before each \texttt{step()} call reads neurons, memory, or input tensor,
+\texttt{\_advance\_backend(alpha)} runs the same C-side updates as the
+training loop's pre-forward block:
+
+\[
+  \texttt{run\_decision\_path},\;
+  \texttt{update\_context},\;
+  \texttt{process\_neurons},\;
+  \texttt{update\_neuron\_states},\;
+  \texttt{update\_attractor\_dynamics},\;
+  \texttt{update\_affective\_complexity},\;
+  \texttt{reshape\_embeddings\_with\_emotion}
+\]
+
+Without this, successive \texttt{step()} calls in a multi-step inference
+loop read identical C-side state and return identical output.
+
+\textbf{Parameter defaults}: \texttt{alpha} is derived from the live
+backend context via \texttt{derive\_alpha\_from\_context} and
+\texttt{derive\_alpha\_from\_params}, matching the training loop's
+per-epoch derivation. \texttt{mem\_weight\_ratio} defaults to the band
+midpoint $\text{BASE} + 0.5 \times \text{RANGE}$, which sits inside the
+envelope the model was trained against. Both can be overridden explicitly.
 
 \subsection{Forward Inference}
 
@@ -638,6 +760,21 @@ but without:
   \item Auxiliary loss computation (output path only)
 \end{itemize}
 
+The temporal encoder and graph reasoner are included in the forward path:
+
+\[
+  X_{\text{enc}} = \texttt{temporal\_encoder}(X_{\text{seq}})
+  \quad,\quad
+  \mathbf{H}_{\text{graph}} = \texttt{graph\_reasoner}(\text{neurons})
+\]
+
+The fused cognitive vector is split into bands before passing to the head:
+
+\[
+  \text{band\_q},\; \text{band\_m} =
+    \texttt{split\_band\_q\_m}(\texttt{normalize}(\text{fused\_cog\_raw}))
+\]
+
 All computation runs with \texttt{@torch.no\_grad()}, preventing gradient
 accumulation and saving memory.
 
@@ -648,13 +785,6 @@ disabled:
 
 \[
   \text{frozen\_input} = \text{False}
-\]
-
-The fused cognitive vector is always fresh (from the live backend) and
-re-normalized:
-
-\[
-  \text{fused\_cog} = \text{normalize}(\text{cognitive\_fuse}(\ldots))
 \]
 
 This mirrors the behavior of a target-refresh epoch in training.
@@ -685,16 +815,18 @@ signal through the auxiliary loss instead.
 
 \subsection{Why Frozen Input Windows}
 
-Updating the target every epoch while the transformer input drifts (due to
-neuron and memory changes) causes the loss to thrash. Pinning both on the
-same refresh schedule prevents chasing a moving target.
+Updating the target every epoch while the fusion-head inputs drift (due to
+neuron, memory, and driver changes) causes the loss to thrash. Pinning all
+inputs and the target on the same refresh schedule prevents chasing a
+moving target. The GAT inputs are pinned at the C-side boundary so the
+GAT parameters keep receiving gradient on every frozen epoch.
 
-\subsection{Why Separate Projections for Bands}
+\subsection{Why Separate Projections for Context Tokens}
 
-Each band carries different information (LLM embedding, neuron state,
-memory). Shared projections would force all streams through the same
-learned mapping. Separate projections (and stream embeddings) allow each
-stream to learn its own representation and let attention decide balance.
+Each context token (band\_q, band\_m, driver) carries different
+information. Separate \texttt{nn.Linear} projections allow each stream to
+learn its own mapping into the shared $d_{\text{model}}$ space and let
+attention determine their balance against the 128 GAT graph tokens.
 
 \subsection{Why SmoothL1 Loss}
 
@@ -728,6 +860,11 @@ Training uses:
 the gradient before adaptive scaling, which under-regularises;
 AdamW applies it directly to the weights and is the correct
 interpretation of $\text{weight\_decay} = 10^{-4}$.
+
+The optimizer covers all trainable modules:
+\texttt{model}, \texttt{fusion\_transformer}, \texttt{graph\_reasoner},
+\texttt{temporal\_encoder}, \texttt{embed\_weight\_net},
+\texttt{cross\_attn}, and \texttt{text\_proj}.
 
 The scheduler steps after each backward pass, ensuring a smooth cosine
 decay over the epoch range.

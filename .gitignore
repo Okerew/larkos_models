@@ -18,3 +18,7 @@ test_checkpoints
 traceback_backups
 *.synctex.gz
 *.fls
+*.aux
+*.log
+*.out
+*.fdb_latexmk

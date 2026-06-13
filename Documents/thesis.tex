@@ -24,20 +24,24 @@ Neuron, Memory and Module Integration}
 
 \begin{abstract}
 This paper introduces the \textbf{Cognitive Fusion Mechanism} (CFM)
-of the Larkos system, a novel architecture that integrates three
-independent information streams: LLM embeddings, neuron states, and
-episodic memory into a shared 64 dimensional space. The design ensures
-information preservation, prevents stream dominance, and enables
-dynamic, context-aware reasoning. We detail the deterministic
-projection, banded assembly, and cross-band mixing processes, and
+of the Larkos system, a novel architecture that integrates LLM
+embeddings and episodic memory through a deterministic C-side banded
+pipeline, and neuron graph reasoning through a Python-side Graph
+Attention Network, into a shared representational space. The fusion
+head attends over per-neuron GAT tokens alongside query, memory, and
+driver context tokens, and pools via a learned-query attention mechanism.
+A temporal attention encoder processes the input history before it
+reaches the main model. The design ensures information preservation,
+prevents stream dominance, and enables dynamic, context-aware reasoning.
+We detail the deterministic projection, two-band assembly, cross-band
+mixing, GAT-based neuron reasoning, and learned-query pooling, and
 present empirical results from the Larkos training loop and inference
 runner. The system demonstrates strong performance in learning
-efficiency, domain transfer, continual learning, meta-learning,
-physics rule adaptation, affective bond interaction, and internal
-world modeling, while maintaining stability and affective coherence.
-Our experiments show that CFM enables robust, interpretable, and
-adaptive cognitive modeling, paving the way for more human-like AI
-systems.
+efficiency, domain transfer, continual learning, meta-learning, physics
+rule adaptation, affective bond interaction, and internal world modeling,
+while maintaining stability and affective coherence. Our experiments
+show that CFM enables robust, interpretable, and adaptive cognitive
+modeling, paving the way for more human-like AI systems.
 \end{abstract}
 
 
@@ -53,12 +57,16 @@ to new tasks or domains. These limitations stem from rigid
 architectures, over-reliance on massive datasets, and a lack of
 mechanisms for dynamic, context-aware reasoning. In this paper, we
 present the \textbf{Cognitive Fusion Mechanism (CFM)}, a novel
-architecture that integrates LLM embeddings, neuron states, and
-episodic memory into a unified 64 dimensional space. We empirically
-validate CFM through an expanded 12 test framework, demonstrating its
-effectiveness in learning efficiency, domain transfer, continual
-learning, meta-learning, physics-based adaptation, affective bond
-interaction, and internal world modeling, while maintaining stability
+architecture that integrates LLM embeddings and episodic memory through
+a deterministic C-side pipeline, and neuron graph reasoning through a
+Python-side Graph Attention Network (GAT), into a unified representational
+space. The fusion head attends over the full set of per-neuron GAT tokens
+together with query, memory, and driver context tokens. A temporal
+attention encoder provides attended-across-time input history to the main
+model. We empirically validate CFM through an expanded 12 test framework,
+demonstrating its effectiveness in learning efficiency, domain transfer,
+continual learning, meta-learning, physics-based adaptation, affective
+bond interaction, and internal world modeling, while maintaining stability
 and affective coherence. Our results confirm the hypothesis that CFM
 enables robust, interpretable, and adaptive cognitive modeling, paving
 the way for more human-like AI systems.
@@ -90,6 +98,7 @@ draws inspiration from:
     \item \textbf{Deterministic Random Projections:} Techniques such
     as those used in the Johnson-Lindenstrauss lemma, which preserve
     distances and enable efficient dimensionality reduction.
+\item \textbf{Gated attention for Large Language Models }: Gated attention is best understood as a modified full-attention block rather than as a separate attention family.
 \end{itemize}
 
 The CFM architecture addresses the limitations of prior approaches by
@@ -101,19 +110,22 @@ through downstream models like transformers.
 \label{sec:framework}
 
 The Cognitive Fusion Mechanism (CFM) is the core of the Larkos
-system, designed to unify three heterogeneous information streams
-\textbf{LLM query embeddings}, \textbf{neuron states and topology},
-and \textbf{episodic memory} into a single, coherent 64 dimensional
-vector. The architecture prioritizes \textbf{information
-preservation}, \textbf{stream balance}, and \textbf{deterministic
-reproducibility}, while allowing downstream models (e.g., a
-transformer) to learn dynamic weightings.
+system, designed to unify LLM query embeddings, neuron graph reasoning,
+and episodic memory into a coherent representational space. The
+architecture prioritizes \textbf{information preservation},
+\textbf{stream balance}, and \textbf{deterministic reproducibility},
+while allowing downstream models to learn dynamic weightings.
+
+The C-side pipeline handles the LLM query and memory streams,
+producing a 64-dimensional fused vector split into two contiguous bands.
+The neuron graph is handled by the Python-side \texttt{\_NeuronGraphReasoner}
+(a two-layer GAT), which produces per-neuron token embeddings that feed
+the fusion head directly, preserving graph topology end-to-end.
 
 \subsection{Input Streams}
 \label{subsec:input_streams}
 
-CFM operates on three primary input streams, each capturing distinct
-aspects of the system's state and context:
+CFM operates on two C-side streams plus a separate graph token sequence:
 
 \begin{itemize}
     \item \textbf{LLM Query Stream:}
@@ -123,25 +135,25 @@ aspects of the system's state and context:
     embedding is projected and blended with the LLM query at 50\%
     strength to ensure direct influence without gating bias.
 
-    \item \textbf{Neuron Stream:}
-    A flattened feature vector $\mathbf{n}_{\text{flat}} \in
-    \mathbb{R}^{16N}$ (where $N \leq 8$) for up to 8 active neurons.
-    Each neuron contributes:
-    \begin{itemize}
-        \item 4 scalar fields (state, output, connections, layer).
-        \item 12 connection indices and weights (6 connections, each
-        with an index and weight).
-    \end{itemize}
-    This captures both local activations and \textbf{graph topology}.
-
     \item \textbf{Memory Stream:}
-    Up to $M = 300$ episodic memory entries, each consisting of:
+    Up to $M = 1200$ episodic memory entries, each consisting of:
     \begin{itemize}
-        \item A rich vector $\mathbf{v}_i \in \mathbb{R}^{22}$
+        \item A rich vector $\mathbf{v}_i \in
+        \mathbb{R}^{2 \cdot \text{MAX\_NEURONS} + \text{INPUT\_SIZE}}$
         (combining prior neuron states and external input features).
         \item An importance weight $\alpha_i$.
         \item A timestamp $\tau_i$.
     \end{itemize}
+
+    \item \textbf{Neuron Graph (Python-side):}
+    Up to $N = \text{MAX\_NEURONS}$ neurons, each with state, output,
+    layer id, connections, and edge weights. The GAT reads these
+    directly and produces a token sequence
+    $\mathbf{H}_{\text{graph}} \in
+    \mathbb{R}^{N \times d_{\text{gat}}}$ that enters the fusion head
+    as a set of per-neuron tokens. Node features include state,
+    output, layer one-hot encoding, connection degree, state velocity,
+    output magnitude, and mean edge weight (8 dimensions per node).
 \end{itemize}
 
 \subsection{Projection Mechanism}
@@ -194,14 +206,14 @@ This ensures uniform variance across output dimensions.
             0 & \text{otherwise}
         \end{cases}
     \end{equation}
-    Each band uses a distinct seed (1009, 2003, 3001) to ensure
-    orthogonal subspaces.
+    Each band uses a distinct seed (1009 for the query band, 3001 for
+    the memory band) to ensure orthogonal subspaces.
 \end{itemize}
 
 \subsection{Processing Pipeline}
 \label{subsec:pipeline}
 
-The CFM pipeline consists of six stages:
+The C-side CFM pipeline consists of five stages:
 
 \begin{enumerate}
     \item \textbf{LLM Query Processing:}
@@ -214,16 +226,9 @@ The CFM pipeline consists of six stages:
         \right)
     \end{equation}
 
-    \item \textbf{Neuron Feature Extraction:}
-    The flattened neuron vector is projected and normalized:
-    \begin{equation}
-        \mathbf{n} =
-        \text{LayerNorm}(\text{proj}(\mathbf{n}_{\text{flat}}))
-    \end{equation}
-
-    \item \textbf{Top K Memory Attention:}
+    \item \textbf{Top-K Memory Attention:}
     Memory entries are scored via dot product similarity with the
-    query. The top $K$ ($K \leq 8$) entries are selected, and their
+    query. The top $K = \min(M, 32)$ entries are selected, and their
     scores are softmax normalized:
     \begin{equation}
         \pi_i = \text{softmax}(s_i) =
@@ -243,14 +248,12 @@ The CFM pipeline consists of six stages:
 
     \item \textbf{Banded Assembly:}
     Each stream is re-projected into a disjoint band of the 64D
-    output:
+    output ($\text{BAND\_Q} = \text{BAND\_M} = 32$):
     \begin{align}
-        \text{fused}[0:22]  &=
-            \text{proj\_band}(\mathbf{q},  0, 22, 1009) \\
-        \text{fused}[22:43] &=
-            \text{proj\_band}(\mathbf{n}, 22, 21, 2003) \\
-        \text{fused}[43:64] &=
-            \text{proj\_band}(\mathbf{m}, 43, 21, 3001)
+        \text{fused}[0:32]  &=
+            \text{proj\_band}(\mathbf{q},  0, 32, 1009) \\
+        \text{fused}[32:64] &=
+            \text{proj\_band}(\mathbf{m}, 32, 32, 3001)
     \end{align}
     This guarantees that \textbf{no stream can dominate another} via
     gating.
@@ -292,26 +295,26 @@ $\mathbf{v} \in \mathbb{R}^n$ to zero mean and unit variance:
 \begin{itemize}
     \item \textbf{Deterministic Projection:}
     The C-side fusion is a \textbf{feature extractor}, not a learner.
-    Gradients are killed at the C boundary, so learnable mixing must
-    occur downstream (e.g., in the fusion transformer). The C-side's
-    role is to produce a \textbf{rich, stable, non-degenerate} feature
-    vector.
+    Gradients are killed at the C boundary, so learnable mixing occurs
+    downstream in the fusion transformer. The C-side's role is to
+    produce a \textbf{rich, stable, non-degenerate} feature vector.
 
     \item \textbf{Banded Architecture:}
-    Early designs used sigmoid gating to blend streams, but this
-    allowed neuron/memory states to bury the LLM query. Banding
-    ensures \textbf{each stream is guaranteed representation}, and the
-    transformer learns to weight them.
+    Banding ensures \textbf{each C-side stream is guaranteed
+    representation} and the transformer learns to weight them.
+    Neuron graph information enters the fusion head through the GAT
+    token sequence, which preserves full graph topology rather than
+    collapsing it into a fixed-size projection.
 
-    \item \textbf{TopK Memory Attention:}
-    Softmax over all $M$ memory entries with similar importances
+    \item \textbf{Top-K Memory Attention:}
+    Softmax over all $M = 1200$ memory entries with similar importances
     collapses to uniform weights, reducing memory to noise averaging.
-    Top-K selection ensures a \textbf{peaked, informative} attention
-    distribution.
+    Top-K selection ($K = 32$) ensures a \textbf{peaked, informative}
+    attention distribution.
 
     \item \textbf{Separate Band Seeds:}
     Each band uses a distinct seed in the pseudo-random projection,
-    ensuring the three streams occupy \textbf{orthogonal subspaces}.
+    ensuring the two C-side streams occupy \textbf{orthogonal subspaces}.
 \end{itemize}
 
 
@@ -1133,22 +1136,33 @@ interactions generate \textbf{combined affective signals}.
 \subsection{Performance of the Fusion Transformer Head}
 \label{subsec:fusion_head}
 
-The \textbf{Fusion Transformer Head} treats the fused cognitive vector
-as a 3 token sequence (one token per band). Each band is projected
-into a shared $d_{\text{model}}$ space and passed through a
-transformer encoder. The output is mean pooled and projected to
-neuron dimensions.
+The \textbf{Fusion Transformer Head} attends over a mixed token sequence
+of length $\text{MAX\_NEURONS} + 3$: per-neuron GAT tokens from the
+\texttt{\_NeuronGraphReasoner}, a band\_q token (LLM query band), a
+band\_m token (memory band), and a driver token (\texttt{llm\_embed\_ca}).
+Token-type embeddings distinguish the four kinds of tokens. A 3-layer
+transformer encoder attends over the full sequence; output is pooled via
+a learned-query attention mechanism and projected to neuron dimensions.
 
 \textbf{Why This Works:}
 \begin{itemize}
-    \item \textbf{Separate Projections:}
-    Each band (LLM, neuron, memory) learns its own mapping, allowing
-    the transformer to \textbf{dynamically weight} their contributions
-    via self-attention.
+    \item \textbf{GAT Token Sequence:}
+    Each of the $\text{MAX\_NEURONS}$ neurons contributes its own token,
+    carrying graph topology and edge weights through differentiable
+    attention rather than a fixed projection. The GAT's per-neuron
+    embeddings allow the fusion head to attend selectively to specific
+    neurons rather than treating them as a collapsed scalar summary.
 
-    \item \textbf{Mean Pooling:}
-    Pooling ensures that \textbf{all three streams contribute} to the
-    final output, rather than collapsing to a single dominant stream.
+    \item \textbf{Separate Context Projections:}
+    Band\_q, band\_m, and the driver token each have their own
+    \texttt{nn.Linear}, allowing the transformer to
+    \textbf{dynamically weight} their contributions via self-attention.
+
+    \item \textbf{Learned-Query Attention Pool:}
+    A single learned query computes a softmax over the 131-token
+    sequence, weighted-summing the encoder output. This lets the
+    pooling step learn to up-weight informative tokens rather than
+    giving every token equal voice.
 
     \item \textbf{Adaptive Loss Blending:}
     The loss weights are adjusted based on \textbf{Monte Carlo
@@ -1197,29 +1211,34 @@ This shows that the system is \textbf{highly aroused and surprised}
 \section{Conclusion}
 \label{sec:conclusion}
 In this paper, we introduced the \textbf{Cognitive Fusion Mechanism
-(CFM)}, a novel architecture that unifies LLM embeddings, neuron
-states, and episodic memory into a shared 64 dimensional space.
-Through deterministic projections, banded assembly, and cross-band
-mixing, CFM ensures information preservation, prevents stream
-dominance, and enables dynamic, context-aware reasoning. Our empirical
-evaluation across a 12 test framework demonstrates that CFM excels in
-learning efficiency, domain transfer, continual learning, meta-learning,
-physics rule adaptation, physics world modeling, and affective bond
-interaction, while maintaining stability and affective coherence.
-The internal world model test reveals that the system maintains and
-refines strongly positive RSA alignment throughout training, supported
-by high cluster grounding and temporal structure. The full 12/12 pass
-rate confirms the robustness of the architecture across all evaluated
-dimensions. The results confirm our hypothesis: CFM enables robust,
-interpretable, and adaptive cognitive modeling, addressing key
-limitations of current AI systems, such as catastrophic forgetting and
-poor generalization. The architecture's ability to rapidly adapt,
-retain knowledge, maintain targeted affective bonds, and learn to
-learn paves the way for more human-like AI systems.
-Future work will focus on refining the exploration-exploitation
-balance, enhancing physics transition encoding, improving memory
-diversity, and scaling the architecture to larger, more complex tasks.
-We believe CFM represents a significant step toward achieving
-emergent, human-like cognition in AI.
+(CFM)}, a novel architecture that integrates LLM embeddings and
+episodic memory through a deterministic C-side banded pipeline, and
+neuron graph reasoning through a Python-side Graph Attention Network,
+into a unified representational space. The fusion head attends over
+per-neuron GAT tokens alongside query, memory, and driver context
+tokens, pooled via a learned-query attention mechanism. A temporal
+attention encoder provides attended-across-time input history to the
+main model. Through deterministic projections, two-band assembly,
+cross-band mixing, and GAT-based neuron reasoning, CFM ensures
+information preservation, prevents stream dominance, and enables
+dynamic, context-aware reasoning. Our empirical evaluation across a
+12 test framework demonstrates that CFM excels in learning efficiency,
+domain transfer, continual learning, meta-learning, physics rule
+adaptation, physics world modeling, and affective bond interaction,
+while maintaining stability and affective coherence. The internal
+world model test reveals that the system maintains and refines strongly
+positive RSA alignment throughout training, supported by high cluster
+grounding and temporal structure. The full 12/12 pass rate confirms
+the robustness of the architecture across all evaluated dimensions.
+The results confirm our hypothesis: CFM enables robust, interpretable,
+and adaptive cognitive modeling, addressing key limitations of current
+AI systems, such as catastrophic forgetting and poor generalization.
+The architecture's ability to rapidly adapt, retain knowledge, maintain
+targeted affective bonds, and learn to learn paves the way for more
+human-like AI systems. Future work will focus on refining the
+exploration-exploitation balance, enhancing physics transition encoding,
+improving memory diversity, and scaling the architecture to larger,
+more complex tasks. We believe CFM represents a significant step toward
+achieving emergent, human-like cognition in AI.
 
 \end{document}

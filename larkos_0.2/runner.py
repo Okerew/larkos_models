@@ -3,19 +3,13 @@ import torch
 from modules.backend_state import BackendState
 from modules.config import (
     DEVICE, INPUT_SIZE, INTERNAL_DIM, MAX_NEURONS, FUSION_DIM,
-    FOURIER_OUT_DIM, TEMPORAL_WINDOW, NUM_REGIONS,
-    MEM_WEIGHT_RATIO_BASE, MEM_WEIGHT_RATIO_RANGE,
+    FOURIER_OUT_DIM, TEMPORAL_WINDOW
 )
 from collections import deque
 
 from modules.model import LarkosModel, EMAWrapper
-from modules.strategies import (
-    derive_alpha_from_context, derive_alpha_from_params,
-)
 from modules.training import (
-    _FusionTransformerHead, _NeuronGraphReasoner,
-    _TemporalAttentionEncoder,
-    _EmbedWeightNet, _InputCrossAttention,
+    _FusionTransformerHead, _EmbedWeightNet, _InputCrossAttention,
     _OnlineMinMax, _OnlineMeanStd, _TextCodec,
     _build_embed_ctx, fourier_encode,
 )
@@ -50,10 +44,6 @@ class LarkosRunner:
         self.model = LarkosModel().to(DEVICE)
         self.ema   = EMAWrapper(self.model)
 
-        # Same instantiation order as TrainingLoop so load_checkpoint
-        # restores onto matching attribute names without special-casing.
-        self.temporal_encoder = _TemporalAttentionEncoder().to(DEVICE)
-        self.graph_reasoner = _NeuronGraphReasoner().to(DEVICE)
         self.fusion_transformer = _FusionTransformerHead(
             output_dim=self.model.output_dim
         ).to(DEVICE)
@@ -80,12 +70,6 @@ class LarkosRunner:
         self._cached_target = None
         self._target_epoch  = 0
         self._cached_fused_cog: torch.Tensor | None = None
-        # Mirrors the training-time freeze cache for the driver
-        # embedding. The runner never enters a freeze window at
-        # inference (frozen_input is always False) but the attribute
-        # must exist so load_checkpoint can restore the last training
-        # snapshot onto the runner without error.
-        self._cached_driver: torch.Tensor | None = None
         self._sample_pool: list[str] = []
         self._sample_pool_idx = 0
         self._current_text_input = ""
@@ -118,9 +102,8 @@ class LarkosRunner:
 
     def _eval(self) -> None:
         for module in (
-            self.model, self.temporal_encoder, self.graph_reasoner,
-            self.fusion_transformer, self.embed_weight_net,
-            self.cross_attn, self.text_proj,
+            self.model, self.fusion_transformer,
+            self.embed_weight_net, self.cross_attn, self.text_proj,
         ):
             module.eval()
 
@@ -150,30 +133,12 @@ class LarkosRunner:
             dtype=torch.float32,
         ).to(DEVICE)
 
-    def _advance_backend(self, alpha: float) -> None:
-        # Mirrors the pre-_forward backend updates in TrainingLoop.run()
-        # so successive step() calls actually see evolving neurons /
-        # context / input_tensor / memory. Without this, every step in
-        # a multi-step inference loop reads the identical C-side state
-        # and returns the identical output. Training-only side effects
-        # (motivation, emotion, identity, specialization, bond, memory
-        # writes) stay out — they belong to the gradient loop, not the
-        # readout.
-        region_scores = [alpha] * NUM_REGIONS
-        self.backend.run_decision_path(region_scores)
-        self.backend.update_context()
-        self.backend.process_neurons(scaled_factor=0.6)
-        self.backend.update_neuron_states(scaled_factor=0.6)
-        self.backend.update_attractor_dynamics()
-        self.backend.update_affective_complexity()
-        self.backend.reshape_embeddings_with_emotion()
-
     @torch.no_grad()
     def step(
         self,
         text_input:       str | None = None,
-        mem_weight_ratio: float | None = None,
-        alpha:            float | None = None,
+        mem_weight_ratio: float = 0.5,
+        alpha:            float = 0.5,
     ) -> dict:
         """
         Single forward pass mirroring TrainingLoop._forward minus the
@@ -184,13 +149,6 @@ class LarkosRunner:
         text_input lets the caller drive the model with a sentence;
         when None the restored current_text_input is reused so a fresh
         runner reproduces the last driver the checkpoint trained on.
-
-        alpha / mem_weight_ratio default to None, in which case they
-        are derived the same way the training loop derives them per
-        epoch — from the live backend context and the configured
-        mem-weight band — so cognitive_fuse runs with the same knobs
-        the model was trained against. Passing explicit values still
-        overrides, for experimentation.
         """
         if text_input is not None:
             self._current_text_input = text_input
@@ -198,31 +156,7 @@ class LarkosRunner:
                 self.text_codec.encode(text_input).detach()
             )
 
-        # Derive alpha from live context the same way TrainingLoop.run
-        # does (training.py:1487-1491) so cognitive_fuse's context_factor
-        # tracks the trained distribution instead of a flat 0.5.
-        ctx = self.backend.get_context_state()
-        if alpha is None:
-            alpha = derive_alpha_from_context(ctx)
-            alpha = derive_alpha_from_params(
-                self.backend.get_dynamic_params(), alpha
-            )
-
-        # Advance the C-side dynamics before reading neurons / input /
-        # memory so a multi-step inference loop actually sees state
-        # evolve. Uses the freshly derived alpha as the region score.
-        self._advance_backend(alpha)
-
-        # mem_weight_ratio: training drives this off a loss-history
-        # novelty signal we don't have at inference. Use the band
-        # midpoint (BASE + 0.5 * RANGE) as the neutral default — it
-        # sits inside the [BASE, BASE+RANGE] envelope the model saw
-        # during training rather than a flat 0.5 that ignores the band.
-        if mem_weight_ratio is None:
-            mem_weight_ratio = (
-                MEM_WEIGHT_RATIO_BASE + 0.5 * MEM_WEIGHT_RATIO_RANGE
-            )
-
+        ctx          = self.backend.get_context_state()
         embed_ctx    = _build_embed_ctx(ctx)
         neurons      = self.backend.get_neurons()
         mem_state    = self.backend.get_memory_state()
@@ -245,14 +179,9 @@ class LarkosRunner:
         padded = list(self.input_history)
         while len(padded) < TEMPORAL_WINDOW:
             padded.insert(0, torch.zeros(FOURIER_OUT_DIM))
-        # Stack into [TEMPORAL_WINDOW, FOURIER_OUT_DIM] and run the
-        # temporal encoder so the flattened x_temporal carries
-        # attended-across-time features. Mirrors TrainingLoop.run.
-        x_seq = torch.stack(
-            [t.to(DEVICE) for t in padded], dim=0
+        x_temporal = torch.cat(
+            [t.to(DEVICE) for t in padded], dim=-1
         )
-        x_seq = self.temporal_encoder(x_seq)
-        x_temporal = x_seq.reshape(-1)
         print(
             f"  step: x_temporal shape={tuple(x_temporal.shape)} "
             f"finite={bool(torch.isfinite(x_temporal).all())}"
@@ -302,26 +231,14 @@ class LarkosRunner:
             f"finite={bool(torch.isfinite(fused_cog_raw).all())}"
         )
 
-        # Graph reasoner over the live neuron adjacency. Mirrors the
-        # training-time call in TrainingLoop._forward; the runner is
-        # under @torch.no_grad so the output is auto-detached.
-        graph_tokens = self.graph_reasoner(neurons)
-
         # The transformer was trained with its input frozen across a
         # window; at inference there is no training schedule, so we
         # always treat the input as live (frozen_input=False) and just
         # normalise the fresh C-side reading the way training did on a
         # refresh epoch.
         fused_cog = self.fused_cog_norm.normalize(fused_cog_raw)
-        band_q_in, band_m_in = self.fusion_transformer.split_band_q_m(
-            fused_cog.unsqueeze(0)
-        )
         fused = self.fusion_transformer(
-            graph_tokens = graph_tokens,
-            band_q       = band_q_in,
-            band_m       = band_m_in,
-            driver       = llm_embed_ca.unsqueeze(0),
-            frozen_input = False,
+            fused_cog.unsqueeze(0), frozen_input=False
         )
 
         fused_vec = fused.squeeze(0).detach()
