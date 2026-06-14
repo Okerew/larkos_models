@@ -386,7 +386,7 @@ flowchart TB
 
 | Step | Location | What Happens |
 |---|---|---|
-| **1. C Backend State** | `neural_web.c` | `Neuron[]` states/outputs/weights/layer_ids; hierarchical `MemorySystem`; `GlobalContextManager` context_vector; `MetaController` metacognition; `MotivationSystem`; `SelfIdentity`; `ImaginationSystem`; `SpecializationSystem`; `ReflectionSystem`; `EmotionalSystem` + `AffectiveSystem` + `AttachmentBonds` |
+| **1. C Backend State** | `neural_web.so` | `Neuron[]` states/outputs/weights/layer_ids; hierarchical `MemorySystem`; `GlobalContextManager` context_vector; `MetaController` metacognition; `MotivationSystem`; `SelfIdentity`; `ImaginationSystem`; `SpecializationSystem`; `ReflectionSystem`; `EmotionalSystem` + `AffectiveSystem` + `AttachmentBonds` |
 | **2. Input Build** | `build_input_tensor()` | Stacks neuron states + outputs + flattened weights + step_counter + memory stats → `INPUT_SIZE` floats |
 | **3. Input Normalization** | `_OnlineMinMax` | EMA running min/max per dim (momentum=0.02); normalizes to `[-1,1]`, clamped to `[-3,3]` |
 | **4. Temporal Encoding** | `fourier_encode` + `_TemporalAttentionEncoder` | Fourier-encodes each step (sin+cos, `FOURIER_OUT_DIM`); sliding window of `TEMPORAL_WINDOW` frames fed to a small TransformerEncoder that attends across timesteps; flattened → `x_temporal` |
