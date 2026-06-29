@@ -1,5 +1,5 @@
 """
-Larkos Testing Framework - 9 behavioural tests for the Larkos model.
+Larkos Testing Framework - 12 behavioural tests for the Larkos model.
 
 Each test creates its own BackendState and manages checkpoints
 independently.  Tests are self-contained and can be run individually
