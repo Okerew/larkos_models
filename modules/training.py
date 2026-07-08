@@ -20,7 +20,7 @@ from modules.config import (
     EMOTION_LOG_INTERVAL, N_PREFIX, BAND_M, BAND_Q,
     FUSE_GRAPH_DMODEL, FUSE_GRAPH_NHEAD, FUSE_GRAPH_LAYERS,
     FUSE_GRAPH_DIM_FF, GAT_HEADS, GAT_LAYERS, MAX_CONNECTIONS,
-    TEMPORAL_NHEAD, TEMPORAL_LAYERS, TEMPORAL_DIM_FF, SAMPLE_POOL_SIZE
+    TEMPORAL_NHEAD, TEMPORAL_LAYERS, TEMPORAL_DIM_FF, SAMPLE_POOL_SIZE, D_NODE
 )
 from modules.model import LarkosModel, EMAWrapper
 from modules.strategies import (
@@ -511,7 +511,7 @@ class _NeuronGraphReasoner(nn.Module):
     # of size d_out so identical static features at different neuron
     # indices still get distinct token representations — the GAT alone
     # cannot distinguish two symmetric nodes otherwise.
-    _D_NODE = 8
+    _D_NODE = D_NODE
 
     def __init__(
         self,
