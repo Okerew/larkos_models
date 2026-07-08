@@ -231,3 +231,4 @@ BAND_M = 32
 # Test-data domains
 TEST_DATA = "test_data"
 CKPT_DIR = "test_checkpoints"
+SAMPLE_POOL_SIZE = 8

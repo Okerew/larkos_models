@@ -444,7 +444,7 @@ Then just run the main.py file normally `python main.py`
 | `Documents/fusion_mechanism.tex/pdf` | Fusion mechanism paper (LaTeX) |
 | `Documents/thesis.tex/pdf` | A full paper about the architecture and the CFM, experiments (LaTeX) |
 | `Documents/scaling.md` | Guide for scaling model hyperparameters |
-| `Documents/testing_framework_for_larkos.md` | Test definitions (9 tests: learning, transfer, continual, etc.) |
+| `Documents/testing_framework_for_larkos.md` | Test definitions (12 tests: learning, transfer, continual, etc.) |
 | `tests/` | Python test framework |
 | `Dockerfile` / `build.sh` / `compile.sh` / `run.sh` | Build & run scripts |
 

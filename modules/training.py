@@ -20,7 +20,7 @@ from modules.config import (
     EMOTION_LOG_INTERVAL, N_PREFIX, BAND_M, BAND_Q,
     FUSE_GRAPH_DMODEL, FUSE_GRAPH_NHEAD, FUSE_GRAPH_LAYERS,
     FUSE_GRAPH_DIM_FF, GAT_HEADS, GAT_LAYERS, MAX_CONNECTIONS,
-    TEMPORAL_NHEAD, TEMPORAL_LAYERS, TEMPORAL_DIM_FF, D_NODE
+    TEMPORAL_NHEAD, TEMPORAL_LAYERS, TEMPORAL_DIM_FF, SAMPLE_POOL_SIZE
 )
 from modules.model import LarkosModel, EMAWrapper
 from modules.strategies import (
@@ -511,7 +511,7 @@ class _NeuronGraphReasoner(nn.Module):
     # of size d_out so identical static features at different neuron
     # indices still get distinct token representations — the GAT alone
     # cannot distinguish two symmetric nodes otherwise.
-    _D_NODE = D_NODE
+    _D_NODE = 8
 
     def __init__(
         self,
@@ -1110,7 +1110,7 @@ class TrainingLoop:
 
         self._sample_pool: list[str] = []
         self._sample_pool_idx = 0
-        self._sample_pool_size = 8
+        self._sample_pool_size = SAMPLE_POOL_SIZE
 
         # Seed the first sample; updated each epoch via _data_pipeline
         _first = self._data_pipeline.next_sample()
@@ -1170,6 +1170,7 @@ class TrainingLoop:
         self._ft_norm_ema: float = 0.0
 
         self.loss_history: list[float]          = []
+        self.refresh_loss_history: list[float]  = []
         self.prev_loss:    float                = 0.0
         self.input_history: deque[torch.Tensor] = deque(
             maxlen=TEMPORAL_WINDOW
@@ -1435,7 +1436,7 @@ class TrainingLoop:
             llm_embed_ca = llm_embed_ca,
         )
 
-    def _backward(self, fwd: "_Fwd", epoch: int) -> float:
+    def _backward(self, fwd: "_Fwd", epoch: int) -> tuple[float, float]:
         """
         Computes the scalar loss from a ForwardResult, calls .backward(),
         clips gradients, and steps optimizer + scheduler + EMA.
@@ -1509,7 +1510,7 @@ class TrainingLoop:
         # harder and produces the grad pulse / sawtooth artefact.
         in_frozen_window = (epoch - self._target_epoch) > 0
         if in_frozen_window and loss_val < self._frozen_skip_floor:
-            return loss_val
+            return loss_val, base_loss.item()
 
         loss.backward()
 
@@ -1562,7 +1563,7 @@ class TrainingLoop:
         # Scheduler steps here and owns the LR from this point on.
         self.scheduler.step()
 
-        return loss_val
+        return loss_val, base_loss.item()
 
     # ------------------------------------------------------------------
     # side-effects  (no grad, pure I/O + C backend triggers)
@@ -2122,12 +2123,16 @@ class TrainingLoop:
             )
 
             # ---- backward ----
-            loss_val = self._backward(fwd, epoch)
+            loss_val, base_loss_val = self._backward(fwd, epoch)
 
-            # Only advance the fused_cog distribution stats when the
-            # input is actually allowed to move (i.e. a refresh epoch).
+            # On a refresh epoch the forward just ran against a
+            # brand-new (target, input) pair with weights that were
+            # never updated on it - that loss is the zero-shot
+            # generalisation signal. Log base_loss (fused vs target)
+            # separately as the cleanest measure of transfer.
             if (epoch - self._target_epoch) == 0:
                 self.fused_cog_norm.update(self._last_fused_cog)
+                self.refresh_loss_history.append(base_loss_val)
 
             if epoch == 1 or epoch % VERIFY_INTERVAL == 0:
                 # Comprehensive verification loss: includes all module
