@@ -15,7 +15,6 @@ import modules.backend.network_state as network_state
 import modules.backend.dynamic_paramaters as dynamic_params
 import modules.backend.neuron_managment.update as neuron_update
 import modules.backend.reflections as reflection
-import modules.backend.motivation as motivation
 import modules.backend.self_identity as identity
 import modules.backend.imagination as imagination
 import modules.backend.neuron_managment.specialization as specialization
@@ -78,7 +77,6 @@ class BackendState:
         dynamic_params.bind(lib)
         neuron_update.bind(lib, self.MAX_NEURONS, self.MAX_CONNECTIONS)
         reflection.bind(lib, self.MAX_NEURONS, self.MAX_CONNECTIONS)
-        motivation.bind(lib)
         identity.bind(lib)
         imagination.bind(lib)
         specialization.bind(lib, self.MAX_NEURONS, self.MAX_CONNECTIONS)
@@ -120,7 +118,6 @@ class BackendState:
 
         self.reflect_hist = lib.initializeReflectionSystem()
         self.reflect_params = lib.initializeReflectionParameters()
-        self.motiv_sys = lib.initializeMotivationSystem()
 
         self.ID_NUM_VALUES = 8
         self.ID_NUM_BELIEFS = 16
@@ -192,6 +189,7 @@ class BackendState:
 
         self._prev_outputs = (c_float * self.MAX_NEURONS)(*([0.0] * self.MAX_NEURONS))
         self._prev_states = (c_float * self.MAX_NEURONS)(*([0.0] * self.MAX_NEURONS))
+        self._stability_ref = (c_float * self.MAX_NEURONS)(*([0.0] * self.MAX_NEURONS))
 
     def _refresh_neurons_export(self):
         for i in range(self.MAX_NEURONS):
@@ -274,9 +272,6 @@ class BackendState:
             "history": reflection.serialize_history(self.reflect_hist),
             "params": reflection.serialize_params(self.reflect_params),
         }
-
-    def get_motivation_state(self) -> dict:
-        return motivation.serialize_motivation(self.motiv_sys)
 
     def get_identity_state(self) -> dict:
         return identity.serialize_identity(self.identity_sys)
@@ -461,16 +456,43 @@ class BackendState:
         )
         return self.get_reflection_state()
 
-    def update_motivation(
-        self, performance_delta: float, novelty: float, task_difficulty: float
-    ):
-        self.lib.updateMotivationSystem(
-            self.motiv_sys,
+    def capture_stability_reference(self):
+        # Snapshots neuron states as the reference for measureNetworkStability
+        # so the C-side adaptation can gauge how much the epoch moved them.
+        for i in range(self.MAX_NEURONS):
+            self._stability_ref[i] = self.neurons[i].state
+
+    def adapt_dynamic_parameters(
+        self, performance_delta: float, error_rate: float
+    ) -> dict:
+        # measure -> updateDynamicParameters -> adaptNetworkDynamic. Order
+        # matters: stability must be read before the adaptation mutates the
+        # neuron states, and updateDynamicParameters must run first so
+        # adaptNetworkDynamic consumes the freshly-updated params.
+        stability = float(self.lib.measureNetworkStability(
+            cast(self.neurons, c_void_p),
+            self._stability_ref,
+        ))
+        self.lib.updateDynamicParameters(
+            self.dyn_params,
             c_float(performance_delta),
-            c_float(novelty),
-            c_float(task_difficulty),
+            c_float(stability),
+            c_float(error_rate),
+            cast(self.meta_ctrl, c_void_p),
+            cast(self.metacog, c_void_p),
         )
-        return self.get_motivation_state()
+        self.lib.adaptNetworkDynamic(
+            cast(self.neurons, c_void_p),
+            cast(self.weights, POINTER(c_float)),
+            self.dyn_params,
+            c_float(performance_delta),
+            self.input_tensor_c,
+        )
+        self._refresh_neurons_export()
+        return {
+            "stability": stability,
+            "params":    self.get_dynamic_params(),
+        }
 
     def update_identity(self, new_input: list[float] | None = None):
         inp = (
@@ -616,6 +638,9 @@ class BackendState:
             cast(self.input_tensor_c, POINTER(c_float)),
             self.MAX_NEURONS,
             simulate_steps,
+            cast(self.weights, POINTER(c_float)),
+            cast(self.connections, POINTER(c_uint)),
+            self.MAX_CONNECTIONS,
         )
         self.lib.evaluateScenarioPlausibility(
             new_scenario,
@@ -705,6 +730,9 @@ class BackendState:
             cast(self.input_tensor_c, POINTER(c_float)),
             self.MAX_NEURONS,
             15,
+            cast(self.weights, POINTER(c_float)),
+            cast(self.connections, POINTER(c_uint)),
+            self.MAX_CONNECTIONS,
         )
         blended = (c_float * MEMORY_VECTOR_SIZE)(*([0.0] * MEMORY_VECTOR_SIZE))
         self.lib.blendImaginedOutcomes(

@@ -147,10 +147,17 @@ def derive_alpha_from_context(ctx: dict) -> float:
 def derive_alpha_from_params(
     params: dict, fallback: float
 ) -> float:
-    lr_scale = params.get("learning_rate_scale", None)
-    if lr_scale is None:
+    # The backend's updateDynamicParameters drives current_adaptation_rate
+    # around base_adaptation_rate each epoch, so scale alpha by their ratio
+    # to make the dynamic params actually modulate cognitive_fuse. The old
+    # learning_rate_scale key was never emitted by serialize_params, so this
+    # always returned the fallback and the params were dead weight.
+    rate = params.get("current_adaptation_rate", None)
+    base = params.get("base_adaptation_rate", None)
+    if rate is None or base is None or base <= 0:
         return fallback
-    return float(np.clip(lr_scale * fallback, 0.3, 0.7))
+    scale = float(np.clip(rate / base, 0.5, 2.0))
+    return float(np.clip(scale * fallback, 0.3, 0.7))
 
 
 def update_optimizer_lr(
