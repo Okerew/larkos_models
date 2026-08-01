@@ -76,6 +76,9 @@ def bind(lib: CDLL):
         POINTER(c_float),
         c_int,
         c_int,
+        POINTER(c_float),
+        POINTER(c_uint),
+        c_int,
     ]
     lib.simulateScenario.restype = None
 

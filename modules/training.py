@@ -1635,10 +1635,6 @@ class TrainingLoop:
         # never masks a genuine loss-driven spike.
         novelty         = max(novelty, reflect_novelty, reflect_drift)
         perf_delta      = self.prev_loss - loss_val
-        task_difficulty = float(min(loss_val, 1.0))
-        self.backend.update_motivation(
-            perf_delta, novelty, task_difficulty
-        )
 
         # Low reflection confidence -> push more creative exploration.
         # An unsure backend explores harder without overriding the
@@ -1756,6 +1752,23 @@ class TrainingLoop:
             trust=bond_trust,
             valence=bond_valence,
         )
+
+        # C-side dynamic adaptation driven by this epoch's training
+        # signal. performance_delta is the loss improvement, error_rate
+        # the raw loss, and stability is measured against the reference
+        # captured at the top of the epoch. The updated params feed back
+        # into next epoch's alpha via derive_alpha_from_params.
+        dyn_result = self.backend.adapt_dynamic_parameters(
+            performance_delta=perf_delta,
+            error_rate=float(min(loss_val, 1.0)),
+        )
+        if epoch == 1 or epoch % 5 == 0:
+            print(
+                f"  [epoch {epoch}] dynamic params - "
+                f"stability={dyn_result['stability']:.4f}  "
+                f"adapt_rate="
+                f"{dyn_result['params']['current_adaptation_rate']:.4f}"
+            )
 
         if epoch == 1 or epoch % EMOTION_LOG_INTERVAL == 0:
             emo  = self.backend.get_emotional_state()
@@ -1924,9 +1937,7 @@ class TrainingLoop:
 
             # --- per-epoch backend state reads ---
             meta       = self.backend.get_meta_state()
-            backend_lr = derive_lr(meta)
-
-            # The actual training LR is managed by the scheduler
+            backend_lr = derive_lr(meta)            # The actual training LR is managed by the scheduler
             # (CosineAnnealingLR stepped after each backward).
             # backend_lr is only used for emotional / identity
             # updates in the C backend completely separate.
@@ -1946,6 +1957,10 @@ class TrainingLoop:
             region_scores = [alpha] * NUM_REGIONS
             self.backend.run_decision_path(region_scores)
             self.backend.update_context()
+
+            # Reference state before this epoch mutates the C-side network;
+            # adapt_dynamic_parameters measures stability against it.
+            self.backend.capture_stability_reference()
 
             self.backend.process_neurons(scaled_factor=0.6)
             self.backend.update_neuron_states(

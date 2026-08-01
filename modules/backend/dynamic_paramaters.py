@@ -1,7 +1,7 @@
 from ctypes import (
     CDLL, Structure,
     c_float, c_int,
-    POINTER,
+    POINTER, c_void_p,
 )
 
 
@@ -23,6 +23,35 @@ class DynamicParameters(Structure):
 def bind(lib: CDLL):
     lib.initDynamicParameters.argtypes = []
     lib.initDynamicParameters.restype  = DynamicParameters
+
+    # controller and metacog are c_void_p for the same reason as Neuron*:
+    # keeps this module free of a dependency on meta.py's structs.
+    lib.updateDynamicParameters.argtypes = [
+        POINTER(DynamicParameters),
+        c_float,
+        c_float,
+        c_float,
+        c_void_p,
+        c_void_p,
+    ]
+    lib.updateDynamicParameters.restype = None
+
+    # Neuron* is declared as c_void_p so this module stays free of a
+    # dependency on backend_state's locally-defined Neuron struct.
+    lib.adaptNetworkDynamic.argtypes = [
+        c_void_p,
+        POINTER(c_float),
+        POINTER(DynamicParameters),
+        c_float,
+        POINTER(c_float),
+    ]
+    lib.adaptNetworkDynamic.restype = None
+
+    lib.measureNetworkStability.argtypes = [
+        c_void_p,
+        POINTER(c_float),
+    ]
+    lib.measureNetworkStability.restype = c_float
 
 
 def make_default() -> DynamicParameters:
