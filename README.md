@@ -425,7 +425,7 @@ Run with `sh run.sh`
 Although I don't recommend it you can do this by firstly installing requirements `pip install --no-cache-dir -r requirements.txt`
 also install pytorch: `pip3 install torch`
 you also need to install json-c `sudo apt install libjson-c-dev`.
-Then just run the main.py file normally `python main.py`
+Then just compile the neural_web.c and run the main.py file normally `python main.py`
 
 ---
 
