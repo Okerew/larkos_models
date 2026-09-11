@@ -27,6 +27,8 @@ class ReflectionHistory(Structure):
         ("confidence_threshold",   c_float),
         ("coherence_threshold",    c_float),
         ("consistency_threshold",  c_float),
+        ("consistency_baseline",   c_float),
+        ("saturation_baseline",    c_float),
     ]
 
 
@@ -78,6 +80,8 @@ def serialize_history(hist_ptr) -> dict:
         "confidence_threshold":   float(h.confidence_threshold),
         "coherence_threshold":    float(h.coherence_threshold),
         "consistency_threshold":  float(h.consistency_threshold),
+        "consistency_baseline":   float(h.consistency_baseline),
+        "saturation_baseline":    float(h.saturation_baseline),
         "historical_confidence":  [
             float(h.historical_confidence[i])
             for i in range(HISTORY_SIZE)
@@ -113,3 +117,4 @@ def serialize_metrics(metrics: ReflectionMetrics) -> dict:
         "consistency_score":        float(metrics.consistency_score),
         "potentially_confabulated": bool(metrics.potentially_confabulated),
     }
+

@@ -232,3 +232,28 @@ BAND_M = 32
 TEST_DATA = "test_data"
 CKPT_DIR = "test_checkpoints"
 SAMPLE_POOL_SIZE = 8
+
+# Dynamic epoch controller (modules/epoch_controller.py). Active when
+# training_loop gets epochs=None instead of a fixed count. Statistics
+# are aligned to "cycles" of SAMPLE_POOL_SIZE epochs so one full pass
+# over the prompt pool is compared against the previous one and
+# per-prompt loss differences cancel out.
+DYN_MIN_EPOCHS        = 30    # soft minimum: no stop before this
+DYN_SOFT_MAX_EPOCHS   = 120   # soft limit: plateau rules relax past this
+DYN_MAX_EPOCHS        = 250   # hard cap: unconditional stop
+DYN_PLATEAU_REL_DELTA = 0.02  # cycle-mean improvement below this = flat
+DYN_PLATEAU_PATIENCE  = 2     # consecutive flat cycles needed to stop
+DYN_TARGET_LOSS       = 0.20  # "good enough" cycle-mean total loss
+DYN_TARGET_REFRESH    = 0.20  # "good enough" refresh-epoch base loss
+DYN_GOOD_PATIENCE     = 2     # consecutive good cycles needed to stop
+# A cycle must beat the best cycle mean seen so far by this relative
+# margin, otherwise it counts toward the stagnation stop.
+DYN_STAGN_TOLERANCE   = 0.01
+DYN_STAGN_PATIENCE    = 4     # non-improving cycles needed to stop
+# Trust-gate calibration: healthy training sits at stability ~0.25
+# (the C network mutates every epoch by design) and drift ~0.66, so
+# the gate only fires on genuinely pathological regimes - the old
+# 0.5 floor held every single check and disabled all stop paths.
+DYN_STABILITY_FLOOR   = 0.15  # below this the backend is churning wild
+DYN_DRIFT_CEILING     = 0.75  # above this the reflection is diverging
+DYN_LR_EXHAUSTED      = 2e-5  # scheduler lr at/below this counts as spent

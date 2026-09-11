@@ -39,6 +39,7 @@ from modules.data_pipeline import TextDataPipeline
 from modules.verify import run_verification, LearningPatternTracker
 
 from modules.checkpoint import save_checkpoint, load_checkpoint
+from modules.epoch_controller import EpochController
 
 def _build_embed_ctx(ctx: dict) -> str:
     """
@@ -1045,7 +1046,7 @@ class TrainingLoop:
     def __init__(
         self,
         backend: "BackendState",
-        epochs: int = 5,
+        epochs: int | None = 5,
         initial_alpha: float | None = None,
         data_dir=None,
         resume_from: str | None = None,
@@ -1112,6 +1113,21 @@ class TrainingLoop:
         self._sample_pool_idx = 0
         self._sample_pool_size = SAMPLE_POOL_SIZE
 
+        # epochs=None selects dynamic control: the EpochController
+        # counts epochs and decides when to finalize from cycle-aligned
+        # loss statistics (see modules/epoch_controller.py). An int
+        # keeps the legacy fixed-count behaviour the test framework
+        # relies on.
+        self._epoch_controller = (
+            EpochController(pool_size=self._sample_pool_size)
+            if epochs is None else None
+        )
+        if self._epoch_controller is not None:
+            print(
+                "  dynamic epoch control: "
+                f"{self._epoch_controller.describe()}"
+            )
+
         # Seed the first sample; updated each epoch via _data_pipeline
         _first = self._data_pipeline.next_sample()
         self.text_encoding = (
@@ -1172,6 +1188,11 @@ class TrainingLoop:
         self.loss_history: list[float]          = []
         self.refresh_loss_history: list[float]  = []
         self.prev_loss:    float                = 0.0
+        # Latest C-side reads the epoch controller consumes; set per
+        # epoch inside _side_effects. Neutral defaults so a first-epoch
+        # read can neither force nor block a stop.
+        self._last_dyn_stability: float = 1.0
+        self._last_reflect_drift: float = 0.0
         self.input_history: deque[torch.Tensor] = deque(
             maxlen=TEMPORAL_WINDOW
         )
@@ -1618,6 +1639,7 @@ class TrainingLoop:
          reflect_novelty, reflect_coherence) = _derive_reflection_signal(
             reflect_metrics
         )
+        self._last_reflect_drift = reflect_drift
       
         # Re-gentlefy so the next epoch starts with unsaturated targets.
         self.backend.process_neurons(scaled_factor=0.6)
@@ -1762,6 +1784,7 @@ class TrainingLoop:
             performance_delta=perf_delta,
             error_rate=float(min(loss_val, 1.0)),
         )
+        self._last_dyn_stability = float(dyn_result["stability"])
         if epoch == 1 or epoch % 5 == 0:
             print(
                 f"  [epoch {epoch}] dynamic params - "
@@ -1929,7 +1952,14 @@ class TrainingLoop:
         _seed_lr   = derive_lr(_seed_meta)
         update_optimizer_lr(self.optimizer, _seed_lr)
 
-        for epoch in range(1, self.epochs + 1):
+        # Dynamic mode runs an open-ended while loop the controller
+        # closes; fixed mode reproduces range(1, self.epochs + 1)
+        # exactly (controller is None if and only if epochs is an int).
+        epoch = 0
+        while True:
+            epoch += 1
+            if self._epoch_controller is None and epoch > self.epochs:
+                break
 
             for name, p in self.model.named_parameters():
                 if p.grad is not None:
@@ -2330,6 +2360,29 @@ class TrainingLoop:
             self.loss_history.append(loss_val)
             self.prev_loss = loss_val
 
+            # Dynamic stop decision. The refresh-epoch base loss is the
+            # cleanest generalisation signal the loop produces, so the
+            # controller gets it alongside the total loss; stability /
+            # drift gate how much a given check is trusted.
+            if self._epoch_controller is not None:
+                is_refresh = (epoch - self._target_epoch) == 0
+                if self._epoch_controller.observe(
+                    epoch        = epoch,
+                    loss         = loss_val,
+                    lr           = self.optimizer.param_groups[0]["lr"],
+                    is_refresh   = is_refresh,
+                    refresh_loss = (
+                        base_loss_val if is_refresh else None
+                    ),
+                    stability    = self._last_dyn_stability,
+                    drift        = self._last_reflect_drift,
+                ):
+                    print(
+                        f"  [epoch {epoch}] epoch controller stop - "
+                        f"{self._epoch_controller.stop_reason}"
+                    )
+                    break
+
         # --- post-training ---
         self.backend.consolidate_memory()
         self.backend.save_memory("memory.bin")
@@ -2351,7 +2404,7 @@ class TrainingLoop:
 
 def training_loop(
     backend:  "BackendState",
-    epochs:   int   = 5,
+    epochs:   int | None = 5,
     alpha:    float = 0.5,
     data_dir=None,
     resume_from: str | None = None,
@@ -2360,6 +2413,11 @@ def training_loop(
     start_from: str | None = None,
 ) -> None:
     """
+    epochs      : fixed epoch count (legacy behaviour, the test
+                  framework relies on it) or None for dynamic control -
+                  an EpochController then counts epochs and finalizes
+                  the run when the loss plateaus or drops below the
+                  configured targets (modules/epoch_controller.py).
     resume_from : load a same-architecture checkpoint to continue training.
     start_from  : load a differently-sized checkpoint via partial weight
                   transfer (use when architecture changed, e.g. upscaling

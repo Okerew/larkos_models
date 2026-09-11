@@ -20,7 +20,7 @@ from modules.runner import run_model
 
 def main() -> None:
     backend = BackendState()
-    training_loop(backend, epochs=100, alpha=0.5)
+    training_loop(backend, epochs=None, alpha=0.5)
 
     run_model(
         backend,
