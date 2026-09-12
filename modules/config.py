@@ -257,3 +257,13 @@ DYN_STAGN_PATIENCE    = 4     # non-improving cycles needed to stop
 DYN_STABILITY_FLOOR   = 0.15  # below this the backend is churning wild
 DYN_DRIFT_CEILING     = 0.75  # above this the reflection is diverging
 DYN_LR_EXHAUSTED      = 2e-5  # scheduler lr at/below this counts as spent
+
+JOURNAL_FILE = "memory_journal.json"
+
+# check_consistency verdict bands for MiniLM cosine: >= SUPPORT means
+# the memory holds essentially this claim (same or paraphrase),
+# >= RELATED means topically related evidence exists (the caller
+# judges agreement from the returned texts), below means nothing
+# like it was ever stored. First calibration, tune with use.
+SUPPORT_SIM = 0.75
+RELATED_SIM = 0.45

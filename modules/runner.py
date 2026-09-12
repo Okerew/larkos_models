@@ -22,6 +22,8 @@ from modules.training import (
 from modules.fusion_mechanism.fusion import cognitive_fuse
 from modules.checkpoint import load_checkpoint
 
+import modules.memory_journal as memory_journal
+
 
 
 class LarkosRunner:
@@ -46,6 +48,7 @@ class LarkosRunner:
         use_ema:    bool = True,
     ) -> None:
         self.backend = backend
+        self._mem_path = mem_path
 
         self.model = LarkosModel().to(DEVICE)
         self.ema   = EMAWrapper(self.model)
@@ -102,6 +105,8 @@ class LarkosRunner:
         # cognitive_fuse sees the trained neuron / memory landscape.
         mem_result = self.backend.load_memory(mem_path)
         print(f"  memory load: {mem_result}")
+        journal_result = memory_journal.load()
+        print(f"  journal    : {journal_result}")
         net_result = self.backend.load_network_states()
         print(f"  net load   : {net_result}")
 
@@ -159,7 +164,15 @@ class LarkosRunner:
         # (motivation, emotion, identity, specialization, bond, memory
         # writes) stay out — they belong to the gradient loop, not the
         # readout.
-        region_scores = [alpha] * NUM_REGIONS
+        # Inference has no loss signal, so feeding alpha as the meta
+        # performance read registers as a collapse (error_awareness
+        # spikes to ~0.5). Feed the metacog's own last performance
+        # value instead: a neutral "nothing changed" signal.
+        hist = self.backend.get_meta_state()["metacognition"][
+            "performance_history"
+        ]
+        neutral = hist[-1] if hist and hist[-1] > 0.0 else 0.5
+        region_scores = [neutral] * NUM_REGIONS
         self.backend.run_decision_path(region_scores)
         self.backend.update_context()
         self.backend.process_neurons(scaled_factor=0.6)
@@ -354,6 +367,7 @@ class LarkosRunner:
 
         return {
             "fused":       fused_vec.cpu().numpy(),
+            "fused_cog":   fused_cog_for_decode.cpu().numpy(),
             "model_pred":  model_pred.squeeze(0).cpu().numpy(),
             "text_input":  self._current_text_input,
             "text_output": text_output,

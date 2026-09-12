@@ -34,12 +34,14 @@ from modules.logging_utils import (
     log_epoch, log_context, log_history, log_memory,
 )
 
-from modules.data_pipeline import TextDataPipeline
+from modules.data_pipeline import TextDataPipeline, ListDataPipeline
 
 from modules.verify import run_verification, LearningPatternTracker
 
 from modules.checkpoint import save_checkpoint, load_checkpoint
 from modules.epoch_controller import EpochController
+
+import modules.memory_journal as memory_journal
 
 def _build_embed_ctx(ctx: dict) -> str:
     """
@@ -1052,12 +1054,15 @@ class TrainingLoop:
         resume_from: str | None = None,
         resume_use_ema: bool = False,
         resume_memory_from: str | None = None,
+        texts: list[str] | None = None,
+        keep_journal: bool = False,
     ) -> None:
         self.backend       = backend
         self.epochs        = epochs
         # Caller-supplied alpha used as a starting override on epoch 1;
         # after that, per-epoch context derivation takes over.
         self.initial_alpha = initial_alpha
+        self.keep_journal  = keep_journal
 
         neurons      = backend.get_neurons()
         input_tensor = backend.get_input_tensor()
@@ -1104,9 +1109,15 @@ class TrainingLoop:
         self.fused_cog_norm  = _OnlineMeanStd(FUSION_DIM)
         self.text_codec      = _TextCodec(DEVICE)
 
+        # LLM-supplied texts take priority over the HF data dir so
+        # service-side train calls never depend on the data/ folder.
         self._data_pipeline = (
-            TextDataPipeline(Path(data_dir)) if data_dir is not None
-            else TextDataPipeline()
+            ListDataPipeline(texts) if texts is not None
+            else (
+                TextDataPipeline(Path(data_dir))
+                if data_dir is not None
+                else TextDataPipeline()
+            )
         )
 
         self._sample_pool: list[str] = []
@@ -1627,10 +1638,24 @@ class TrainingLoop:
         )
         print(f"  [epoch {epoch}] text_output : {text_output}")
 
-        self.backend.add_memory_step(fused_np.tolist())
+        mem_step = self.backend.add_memory_step(fused_np.tolist())
+        # The journal keys on the same step counter the C side stamps
+        # entries with, so every vector gets its driver text attached;
+        # the MiniLM embedding rides along for semantic recall
+        emb = memory_journal.encode_cached(
+            self._current_text_input,
+            lambda t: self.model.embedder._st.encode(
+                t, convert_to_numpy=True
+            ),
+        )
+        memory_journal.record(
+            mem_step["step"], self._current_text_input, emb
+        )
 
+        # Post-epoch meta update gets the freshest performance read;
+        # the run() feed above carries the previous epoch's.
         updated_meta = self.backend.update_meta(
-            region_scores
+            [1.0 - min(loss_val, 1.0)] * NUM_REGIONS
         )
         _ = updated_meta
 
@@ -1811,7 +1836,8 @@ class TrainingLoop:
         )
         log_context(self.backend.get_context_state())
         log_history(self.backend.get_network_history())
-        log_memory(self.backend.get_memory_state())
+        mem_state = self.backend.get_memory_state()
+        log_memory(mem_state)
 
         result = self.backend.receive_predictions(
             epoch, neuron_pred.tolist(), fused_np.tolist()
@@ -1945,6 +1971,19 @@ class TrainingLoop:
         return {"transferred": transferred, "skipped": skipped}
 
     def run(self) -> None:
+        if self.keep_journal:
+            # Incremental training on a live memory: keep the journal
+            # instead of wiping it, and bump the C-side step counter
+            # past every timestamp the journal + memory tiers already
+            # hold (same trick Reminiscence.memorize uses for its
+            # writes) so new journal keys never collide with old ones
+            # and the tier joins stay valid.
+            memory_journal.load()
+            self.backend._step_counter = (
+                memory_journal.next_timestamp(self.backend)
+            )
+        else:
+            memory_journal.reset()
         # Seed the optimizer LR once from the first meta read so
         # derive_lr()'s initial value is respected, then the scheduler
         # owns all subsequent adjustments no more per-epoch override
@@ -1984,7 +2023,15 @@ class TrainingLoop:
             if self.initial_alpha is not None:
                 alpha = (alpha + self.initial_alpha) * 0.5
 
-            region_scores = [alpha] * NUM_REGIONS
+            # region_scores feeds the metacog performance history, so
+            # it must carry a performance signal - feeding alpha froze
+            # the whole meta layer at a constant ~0.41. At this point
+            # the freshest performance read is the previous epoch's.
+            prev_perf = (
+                1.0 - min(self.prev_loss, 1.0)
+                if self.loss_history else 0.5
+            )
+            region_scores = [prev_perf] * NUM_REGIONS
             self.backend.run_decision_path(region_scores)
             self.backend.update_context()
 
@@ -2386,6 +2433,8 @@ class TrainingLoop:
         # --- post-training ---
         self.backend.consolidate_memory()
         self.backend.save_memory("memory.bin")
+        journal_result = memory_journal.save()
+        print(f"  journal    : {journal_result}")
         self.backend.save_network_states()
 
         # Torch-side state pairs with the C-side saves above; both
@@ -2411,7 +2460,9 @@ def training_loop(
     resume_use_ema: bool = False,
     resume_memory_from: str | None = None,
     start_from: str | None = None,
-) -> None:
+    texts:    list[str] | None = None,
+    keep_journal: bool = False,
+) -> "TrainingLoop":
     """
     epochs      : fixed epoch count (legacy behaviour, the test
                   framework relies on it) or None for dynamic control -
@@ -2424,6 +2475,16 @@ def training_loop(
                   from pre_model.pt). Memory binaries cannot be transferred
                   across architecture changes; use resume_memory_from only
                   when the architecture is identical.
+    texts       : explicit training texts (the LLM-supplied path); when
+                  given, a ListDataPipeline cycles over them instead of
+                  reading the HF data dir. One text is consumed per epoch
+                  until the sample pool fills.
+    keep_journal: keep and extend the existing journal instead of
+                  resetting it - incremental training on a live memory.
+                  The step counter is bumped past every existing
+                  timestamp so new journal keys never collide.
+    Returns the finished TrainingLoop so callers (the memory service)
+    can read loss_history and friends after run().
     """
     loop = TrainingLoop(
         backend,
@@ -2433,7 +2494,10 @@ def training_loop(
         resume_from=resume_from,
         resume_use_ema=resume_use_ema,
         resume_memory_from=resume_memory_from,
+        texts=texts,
+        keep_journal=keep_journal,
     )
     if start_from is not None:
         loop.start_training_from(start_from)
     loop.run()
+    return loop
