@@ -7,11 +7,11 @@ from ctypes import (
     c_float, c_int, c_uint,
 )
 
-from modules.config import DEVICE, MAX_CONNECTIONS, MEMORY_VECTOR_SIZE, FUSION_MEM_TOP_K
-from modules.backend.memory import MAX_SERIALIZED_ENTRIES
+from modules.config import DEVICE, MAX_CONNECTIONS, MEMORY_VECTOR_SIZE
 
 _LIB_PATH = pathlib.Path(__file__).parent / "libfusion.so"
 _lib: CDLL | None = None
+
 
 def _load() -> CDLL:
     global _lib
@@ -89,13 +89,6 @@ def _mem_entries_to_c(
     for tier in ("short_term", "medium_term", "long_term"):
         raw.extend(mem_state.get(tier, {}).get("entries", []))
 
-    if len(raw) > FUSION_MEM_TOP_K:
-        raw.sort(
-            key=lambda e: float(e.get("importance", 0.0)),
-            reverse=True,
-        )
-        raw = raw[:FUSION_MEM_TOP_K]
-
     n   = len(raw)
     arr = (_CMemEntry * max(n, 1))()
     for i, e in enumerate(raw):
@@ -107,57 +100,14 @@ def _mem_entries_to_c(
     return arr, n
 
 
-def mem_entries_from_c(mem_sys, top_k: int | None = None):
-    """Importance-sampled entry array read straight from the C-side
-    structs. The inference hot path must not round-trip up to 30k
-    Python dicts (what serialize_state builds) just to hand the same
-    bytes back to ctypes: a light (importance, level, idx) pass
-    capped like serialize_state picks the winners first, then only
-    the top_k winners get their vectors copied."""
-    if top_k is None:
-        top_k = FUSION_MEM_TOP_K
-    if not mem_sys:
-        return (_CMemEntry * 1)(), 0
-    ms = mem_sys.contents
-    scored = []
-    for level in (
-        ms.hierarchy.short_term,
-        ms.hierarchy.medium_term,
-        ms.hierarchy.long_term,
-    ):
-        n = max(
-            0, min(
-                int(level.size), int(level.capacity),
-                MAX_SERIALIZED_ENTRIES,
-            )
-        )
-        for i in range(n):
-            scored.append(
-                (float(level.entries[i].importance), level, i)
-            )
-    if not scored:
-        return (_CMemEntry * 1)(), 0
-    scored.sort(key=lambda t: t[0], reverse=True)
-    winners = scored[:top_k]
-    arr = (_CMemEntry * len(winners))()
-    for k, (imp, level, i) in enumerate(winners):
-        e = level.entries[i]
-        arr[k].importance = imp
-        arr[k].timestamp = int(e.timestamp)
-        for j in range(MEMORY_VECTOR_SIZE):
-            arr[k].vector[j] = e.vector[j]
-    return arr, len(winners)
-
-
 def cognitive_fuse(
     llm_embed:       torch.Tensor,
     neurons:         dict,
-    mem_state:       dict | None = None,
+    mem_state:       dict,
     default_weights: torch.Tensor | None = None,
     mem_weight_ratio: float = 1.0,
     context_factor:  float = 0.5,
     text_embed:      torch.Tensor | None = None,
-    mem_entries:     tuple | None = None,
 ) -> torch.Tensor:
     """
     Projects the LLM embedding, neuron states (including graph
@@ -186,10 +136,7 @@ def cognitive_fuse(
     embed_c  = embed_np.ctypes.data_as(POINTER(c_float))
 
     n_arr, n_count = _neurons_to_c(neurons)
-    if mem_entries is None:
-        m_arr, m_count = _mem_entries_to_c(mem_state or {})
-    else:
-        m_arr, m_count = mem_entries
+    m_arr, m_count = _mem_entries_to_c(mem_state)
 
     if default_weights is not None:
         dw_np = default_weights.detach().cpu().float().numpy()

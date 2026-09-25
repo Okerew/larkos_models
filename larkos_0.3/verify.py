@@ -13,12 +13,6 @@ from modules.config import (
     LR_SENSITIVITY_DELTA, GRAD_SMOOTH_ALPHA,
     DEAD_WINDOW, DETACHED_LABELS,
 )
-from modules.strategies import bf16_autocast
-
-try:
-    import bitsandbytes as _bnb
-except ImportError:
-    _bnb = None
 
 
 @dataclass
@@ -239,49 +233,24 @@ def check_overfit(
     steps:     int = OVERFIT_STEPS,
 ) -> None:
     """
-    Checks that a single fixed (x, y) pair can be memorised in a small
+    Clones the model to avoid mutating training state, then checks
+    that a single fixed (x, y) pair can be memorised in a small
     number of steps. Persistent failure here means the architecture
     cannot learn at all on this input size / shape combination.
-
-    The old version deep-copied the model onto the GPU so training
-    state stayed untouched - at ~805M params the copy plus its own
-    fp32 Adam moments added ~13 GB and OOM'd a 12 GB card. The probe
-    now uses the same trick as the MAML inner loop: snapshot the
-    trainable params to CPU, overfit the LIVE model in place with an
-    8-bit Adam (~1.7 GB of probe moments instead of 6.4 GB), then
-    copy the snapshot back through .data (a plain copy_ would bump
-    version counters on params the retained verifier graph still
-    references). The probe's first zero_grad(set_to_none) also frees
-    the grad block the check_gradients backward left behind, so the
-    peak here is weights + training moments + probe moments + one
-    grad block, not two of everything.
     """
-    params = [p for p in model.parameters() if p.requires_grad]
-    saved  = [p.detach().to("cpu", copy=True) for p in params]
+    import copy
+    m_clone = copy.deepcopy(model).to(DEVICE)
+    m_clone.train()
+    opt_clone = torch.optim.Adam(m_clone.parameters(), lr=1e-3)
 
-    if _bnb is not None and torch.cuda.is_available():
-        opt_probe = _bnb.optim.Adam8bit(params, lr=1e-3)
-    else:
-        opt_probe = torch.optim.Adam(params, lr=1e-3)
-
-    model.train()
     prev = None
-    try:
-        for _ in range(steps):
-            opt_probe.zero_grad()
-            with bf16_autocast():
-                pred = model(x_fixed, embed_ctx)
-                loss = criterion(pred, y_fixed)
-            loss.backward()
-            opt_probe.step()
-            prev = loss.item()
-    finally:
-        for p, sv in zip(params, saved):
-            p.data.copy_(sv)
-        # free the probe's grads + 8-bit states before returning so
-        # the next epoch starts from the normal footprint
-        opt_probe.zero_grad(set_to_none=True)
-        del opt_probe
+    for _ in range(steps):
+        opt_clone.zero_grad()
+        pred = m_clone(x_fixed, embed_ctx)
+        loss = criterion(pred, y_fixed)
+        loss.backward()
+        opt_clone.step()
+        prev = loss.item()
 
     if prev is None or prev > OVERFIT_THRESH:
         r.fail(
@@ -720,4 +689,3 @@ def run_verification(
 
     print(r.summary())
     return r
-

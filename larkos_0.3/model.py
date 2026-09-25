@@ -1,7 +1,6 @@
 import copy
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint as _ckpt
 from sentence_transformers import SentenceTransformer
 
 from modules.config import (
@@ -194,19 +193,8 @@ class LarkosModel(nn.Module):
             cls = cls.expand(tokens.shape[0], -1, -1)
             tokens = torch.cat([cls, tokens], dim=1)
 
-        # (B, seq, d_model) -> use CLS position (index 0) as summary.
-        # Each encoder layer runs under gradient checkpointing: the
-        # attention/FF activations are dropped after forward and
-        # recomputed in backward, which is the single biggest VRAM
-        # saving at seq_len = MODEL_INPUT_DIM + 1. use_reentrant=False
-        # keeps RNG (dropout) consistent across the recompute and
-        # degrades to a plain call under no_grad, so the runner /
-        # MC-dropout paths pay nothing.
-        enc_out = tokens
-        for layer in self.encoder.layers:
-            enc_out = _ckpt(layer, enc_out, use_reentrant=False)
-        if self.encoder.norm is not None:
-            enc_out = self.encoder.norm(enc_out)
+        # (B, seq, d_model) -> use CLS position (index 0) as summary
+        enc_out = self.encoder(tokens)
         summary = enc_out[:, 0, :]
 
         out = self.head(summary)
@@ -220,11 +208,6 @@ class EMAWrapper:
     .apply_shadow() / .restore() around inference to
     get the smoother shadow weights without touching
     the training graph.
-
-    Shadow tensors live on CPU so the EMA costs zero VRAM; the
-    per-update copy and the apply/restore loads do the (small,
-    once-per-epoch) device transfers. checkpoint.py already saved
-    the shadow detached-to-CPU, so the file format is unchanged.
     """
 
     def __init__(
@@ -233,33 +216,21 @@ class EMAWrapper:
         decay: float = EMA_DECAY,
     ) -> None:
         self.decay  = decay
-        self.shadow = {
-            k: v.detach().cpu().clone()
-            for k, v in model.state_dict().items()
-        }
+        self.shadow = copy.deepcopy(model.state_dict())
 
     def update(self, model: nn.Module) -> None:
         for k, v in model.state_dict().items():
-            sv = self.shadow[k]
             if v.dtype.is_floating_point:
-                sv.mul_(self.decay).add_(
-                    v.detach().to(
-                        device=sv.device, dtype=sv.dtype
-                    ),
-                    alpha=1.0 - self.decay,
+                self.shadow[k] = (
+                    self.decay * self.shadow[k]
+                    + (1.0 - self.decay) * v
                 )
             else:
-                self.shadow[k] = v.detach().cpu().clone()
+                self.shadow[k] = v
 
     def apply_shadow(self, model: nn.Module) -> None:
-        self._backup = {
-            k: v.detach().cpu().clone()
-            for k, v in model.state_dict().items()
-        }
-        # load_state_dict copies element-wise, so handing it the CPU
-        # shadow dict works on a GPU model without an extra full copy
+        self._backup = copy.deepcopy(model.state_dict())
         model.load_state_dict(self.shadow)
 
     def restore(self, model: nn.Module) -> None:
         model.load_state_dict(self._backup)
-

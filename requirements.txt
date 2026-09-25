@@ -2,3 +2,4 @@ numpy
 sentence-transformers
 pyarrow
 datasets
+bitsandbytes
