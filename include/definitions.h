@@ -1,11 +1,12 @@
 #ifndef DEFINITIONS_H
 #define DEFINITIONS_H
 
-#define MAX_NEURONS 8
-#define MAX_CONNECTIONS 6
+/* 128N production config (see Documents/scaling.md "128N" column). */
+#define MAX_NEURONS 128
+#define MAX_CONNECTIONS 32
 #define STEPS 100
-#define INPUT_SIZE 6            // Size of the input tensor
-#define MEMORY_BUFFER_SIZE 1000 // Size of circular memory buffer
+#define INPUT_SIZE 32           // Size of the input tensor
+#define MEMORY_BUFFER_SIZE 4096 // Size of circular memory buffer
 #define MEMORY_VECTOR_SIZE (2 * MAX_NEURONS + INPUT_SIZE)
 #define DECAY_FACTOR 0.95f           // Decay factor for memory over time
 #define CONSOLIDATION_THRESHOLD 0.7f // Threshold to consolidate memories
@@ -14,9 +15,9 @@
 #define OPTIMIZATION_WINDOW 5  // Number of steps to consider for optimization
 #define PERFORMANCE_THRESHOLD 0.8 // Target performance improvement threshold
 #define MAX_BATCH_SIZE 16         // Maximum batch size for processing
-#define EMBEDDING_SIZE 16         // Size of word embeddings
-#define WEIGHT_DECAY 0.95f        // Weight decay factor
-#define MAX_SIMULATIONS 10        // Number of simulation runs
+#define EMBEDDING_SIZE 256
+#define WEIGHT_DECAY 0.95f // Weight decay factor
+#define MAX_SIMULATIONS 10 // Number of simulation runs
 #define DECAY_RATE 0.8f
 #define INPUT_WEIGHT 0.1f
 #define CONNECTION_WEIGHT 0.2f
@@ -29,12 +30,15 @@
 #define MAX_WEIGHT 1.0f
 #define MAX_SIMULATIONS 10 // Number of simulation runs
 #define NUM_TIME_STEPS 20
-#define FEATURE_VECTOR_SIZE 128
-#define CONTEXT_VECTOR_SIZE 256
+#define FEATURE_VECTOR_SIZE 512
+#define CONTEXT_VECTOR_SIZE 1024
+#define ACTIVATION_HISTORY_SIZE 200
+#define HISTORY_SIZE 500
+#define REASONING_SIZE 4096
 #define CLAMP_MIN -1e6f // Min value for feature or coherence
 #define CLAMP_MAX 1e6f  // Max value for feature or coherence
 #define PATTERN_SIZE 3
-#define EXPERIENCE_VECTOR_SIZE 256
+#define EXPERIENCE_VECTOR_SIZE 1024
 #define HISTORY_LENGTH 10
 #define NUM_PATHS 5
 #define MAX_DECISION_STEPS 20
@@ -53,7 +57,7 @@
 #define MAX_SCENARIOS 10
 #define MAX_SCENARIO_STEPS 20
 #define MAX_SCENARIO_NAME_LENGTH 100
-#define MAX_SPECIALIZATIONS 9
+#define MAX_SPECIALIZATIONS 8
 #define MAX_SPECIALIZED_NEURONS 64
 #define MAX_OUTCOMES_PER_SCENARIO 10
 #define SPARSE_DENSITY                                                         \
@@ -61,11 +65,14 @@
 #define NUM_SEMANTIC_LAYERS 4 // Hierarchical representation layers
 #define CONTEXT_WINDOW 8      // Context for dynamic embeddings
 #define HASH_BUCKETS 1024     // For efficient similarity SearchResults
+#define HARM_WEIGHT 0.5f
+#define UNCERTAINTY_WEIGHT 0.3f
+#define BENEFIT_WEIGHT 0.2f
 #define MAX_TEXT_LENGTH 4096
 #define MAX_TOKENS 512
 #define MAX_TOKEN_LENGTH 64
 #define NGRAM_SIZE 3
-#define NUM_HEADS 8
+#define NUM_HEADS 16 // divides EMBEDDING_SIZE=256
 #define HEAD_DIM (EMBEDDING_SIZE / NUM_HEADS)
 #define DROPOUT_RATE 0.1f
 #define MAX_LINE_LENGTH 10000
@@ -82,9 +89,6 @@
 #define EMOTION_HISTORY_SIZE 100
 #define MAX_EMOTION_PATTERNS 10
 #define NEURON_STRIDE 4
-#define ACTIVATION_HISTORY_SIZE 50
-#define HISTORY_SIZE 100
-#define REASONING_SIZE 1024
 #define BEHAVIOR_WINDOW 16
 #define MAX_GUARDRAIL_FINDINGS 32
 #define MAX_RECOVERY_DEPTH 8
