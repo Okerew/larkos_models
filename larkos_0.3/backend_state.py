@@ -232,7 +232,7 @@ class BackendState:
         )
         return build_input_tensor(
             states, outputs, weights_flat,
-            self._step_counter, self.get_memory_stats(),
+            self._step_counter, self.get_memory_state(),
             memory.MEMORY_CAPACITY, self.INPUT_SIZE,
         )
 
@@ -261,18 +261,6 @@ class BackendState:
 
     def get_memory_state(self) -> dict:
         return memory.serialize_state(self.mem_sys)
-
-    def get_entry_meta(self) -> list:
-        return memory.entry_meta(self.mem_sys)
-
-    def get_entry_views(self) -> list:
-        return memory.entry_views(self.mem_sys)
-
-    def get_memory_stats(self) -> dict:
-        # Sizes/capacities only - the per-step input builder and tier
-        # counters use this so a 1M-entry memory never gets marshalled
-        # entry-by-entry on the hot path
-        return memory.serialize_stats(self.mem_sys)
 
     def get_network_history(self) -> list:
         return network_state.serialize_history(

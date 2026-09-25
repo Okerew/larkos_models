@@ -4,8 +4,6 @@ from ctypes import (
     POINTER,
 )
 
-import numpy as np
-
 from modules.config import (
     MAX_NEURONS, INPUT_SIZE,
     MEMORY_VECTOR_SIZE,
@@ -108,14 +106,6 @@ class WorkingMemorySystem(Structure):
 
 FeatureMatrix = (c_float * MEMORY_VECTOR_SIZE) * FEATURE_VECTOR_SIZE
 
-# Hard cap on how many entries per level serialize_state will marshal
-# into Python dicts. With MEMORY_CAPACITY at 1M a full serialization
-# would build ~30k+ dicts of 288 floats PER CALL (journal joins, API
-# status, output prompt, cognitive_fuse sampling all read it), so the
-# entry list is truncated while size/capacity stay truthful. Consumers
-# that only need counts use serialize_stats instead.
-MAX_SERIALIZED_ENTRIES = 10_000
-
 
 def bind(lib: CDLL):
     lib.createMemorySystem.argtypes = [c_uint]
@@ -178,85 +168,6 @@ def serialize_level(entries_ptr, size: int) -> list:
     return out
 
 
-def _iter_levels(ms):
-    return (
-        ("short_term",  ms.hierarchy.short_term),
-        ("medium_term", ms.hierarchy.medium_term),
-        ("long_term",   ms.hierarchy.long_term),
-    )
-
-
-def _level_count(level) -> int:
-    return max(
-        0, min(
-            int(level.size), int(level.capacity),
-            MAX_SERIALIZED_ENTRIES,
-        )
-    )
-
-
-def entry_meta(mem_sys) -> list:
-    """[(level, timestamp, importance)] for every serialized entry,
-    same per-level cap as serialize_state but with the 288-float
-    vectors skipped - tier joins, next_timestamp and status ranking
-    run on every API call and never touch the vectors."""
-    if not mem_sys:
-        return []
-    out = []
-    for name, level in _iter_levels(mem_sys.contents):
-        for i in range(_level_count(level)):
-            e = level.entries[i]
-            out.append((name, int(e.timestamp), float(e.importance)))
-    return out
-
-
-def entry_views(mem_sys) -> list:
-    """Same walk as entry_meta but the vector rides along as a
-    zero-copy ndarray view into the C memory, so state-mode recall
-    can score entries without building per-entry Python dicts."""
-    if not mem_sys:
-        return []
-    out = []
-    for name, level in _iter_levels(mem_sys.contents):
-        for i in range(_level_count(level)):
-            e = level.entries[i]
-            out.append((
-                name, int(e.timestamp), float(e.importance),
-                np.ctypeslib.as_array(e.vector),
-            ))
-    return out
-
-
-def serialize_stats(mem_sys) -> dict:
-    """Sizes-and-capacities-only view of the memory system.
-
-    Same top-level shape as serialize_state minus the entry lists, so
-    per-step consumers (build_input_tensor churn channels, tier
-    counts) never pay the per-entry marshalling cost. At 1M capacity
-    that cost dominates the step otherwise.
-    """
-    if not mem_sys:
-        return {"size": 0, "capacity": 0,
-                "short_term": {"size": 0, "capacity": 0},
-                "medium_term": {"size": 0, "capacity": 0},
-                "long_term": {"size": 0, "capacity": 0}}
-    ms = mem_sys.contents
-
-    def _level(level):
-        return {
-            "size":     int(level.size),
-            "capacity": int(level.capacity),
-        }
-
-    return {
-        "size":        int(ms.size),
-        "capacity":    int(ms.capacity),
-        "short_term":  _level(ms.hierarchy.short_term),
-        "medium_term": _level(ms.hierarchy.medium_term),
-        "long_term":   _level(ms.hierarchy.long_term),
-    }
-
-
 def serialize_state(mem_sys) -> dict:
     if not mem_sys:
         return {"size": 0, "capacity": 0,
@@ -268,7 +179,7 @@ def serialize_state(mem_sys) -> dict:
     def _level(level):
         size = int(level.size)
         cap  = int(level.capacity)
-        n = max(0, min(size, cap, MAX_SERIALIZED_ENTRIES))
+        n = max(0, min(size, cap, MEMORY_CAPACITY * 2))
         return {
             "size":     size,
             "capacity": cap,
@@ -282,5 +193,4 @@ def serialize_state(mem_sys) -> dict:
         "medium_term": _level(ms.hierarchy.medium_term),
         "long_term":   _level(ms.hierarchy.long_term),
     }
-
 

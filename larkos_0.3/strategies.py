@@ -3,30 +3,11 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from contextlib import contextmanager
-from typing import Callable
 
 from modules.config import (
-    BASE_LR, MAX_NEURONS, DEVICE,
+    BASE_LR, MAX_NEURONS,
     MAML_INNER_LR, MAML_INNER_STEPS,
 )
-
-
-@contextmanager
-def bf16_autocast():
-    """
-    bf16 autocast on CUDA, no-op anywhere else. No GradScaler is
-    needed - bf16 keeps fp32's exponent range so gradients don't
-    underflow the way fp16's do. Master weights stay fp32; only the
-    op-level math runs in bf16.
-    """
-    if DEVICE.type == "cuda":
-        with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16
-        ):
-            yield
-    else:
-        yield
 
 
 def build_neuron_prediction(neurons: dict) -> np.ndarray:
@@ -189,73 +170,42 @@ def update_optimizer_lr(
 
 def maml_inner_update(
     model:     nn.Module,
+    fast:      nn.Module,
     x:         torch.Tensor,
     target:    torch.Tensor,
     criterion: nn.Module,
     embed_ctx: str | None = None,
-) -> Callable[[], None]:
+) -> nn.Module:
     """
-    MAML-lite inner loop via save/restore on ONE model. At the 1B
-    scale a persistent fast clone would double the weight + grad
-    footprint, so instead: the trainable params are saved to CPU, a
-    few fast-adaptation SGD steps run on the model itself, and the
-    returned restore() closure puts the original values back.
+    MAML-lite inner loop - refreshes the persistent `fast` clone with
+    the outer model's trainable params and runs a few fast-adaptation
+    SGD steps on it without touching the outer weights. Returns `fast`
+    so the caller can compute the outer loss against it; the original
+    model is untouched.
 
-    Call pattern (see training.py _forward):
+    `fast` must be a same-shape sibling of `model` (built with the
+    same constructor). Only `requires_grad` params are refreshed, so
+    frozen submodules (e.g. the pretrained ST encoder) are NOT recopied
+    — the per-epoch cost stays at the small trainable subset rather
+    than the 22M-param frozen MiniLM the old copy.deepcopy(model)
+    pulled in.
 
-        restore = maml_inner_update(model, x, target, crit, ctx)
-        maml_pred = model(x, ctx)      # adapted weights, in-graph
-        restore()                      # before the outer backward
-
-    The outer loss then differentiates maml_pred w.r.t. the REAL
-    params, so - unlike the old disconnected clone, whose grads were
-    never stepped - outer_loss now actually trains the model at the
-    adapted point (first-order MAML / Reptile semantics; the inner
-    adaptation is 3 tiny SGD steps, so the restore-vs-adapted weight
-    difference the backward sees is O(MAML_INNER_LR) and negligible).
-
-    Only `requires_grad` params are saved/stepped, so the frozen
-    22M-param ST encoder is untouched. The saved copy lives on CPU:
-    a second fp32 copy of ~800M params (~3.2 GB) does not fit the
-    GPU budget alongside grads + moments + activations, and the two
-    PCIe transfers per epoch are cheap next to the inner steps.
+    We skip this when embed_ctx is None - the embedding path is the
+    main signal that benefits from fast adaptation and running it on
+    raw numerics alone gives negligible gain.
     """
-    params = [p for p in model.parameters() if p.requires_grad]
-    saved  = [p.detach().to("cpu", copy=True) for p in params]
-
-    model.train()
+    with torch.no_grad():
+        for p_main, p_fast in zip(model.parameters(), fast.parameters()):
+            if p_main.requires_grad:
+                p_fast.data.copy_(p_main.data)
+    fast.train()
+    inner_opt = torch.optim.SGD(
+        fast.parameters(), lr=MAML_INNER_LR
+    )
     for _ in range(MAML_INNER_STEPS):
-        for p in params:
-            p.grad = None
-        with bf16_autocast():
-            pred = model(x, embed_ctx)
-            loss = criterion(pred, target)
+        inner_opt.zero_grad()
+        pred = fast(x, embed_ctx)
+        loss = criterion(pred, target)
         loss.backward()
-        # Manual plain-SGD step through .data: torch.optim.SGD bumps
-        # the autograd version counters of the params it steps, which
-        # poisons every live graph over those params - and the caller
-        # keeps the pre-MAML model_pred / fusion graphs alive across
-        # this loop, so a version bump there = "modified by an
-        # inplace operation" at the outer loss.backward(). The .data
-        # path is invisible to versioning (same trick the old
-        # fast-clone refresh used).
-        for p in params:
-            if p.grad is not None:
-                p.data.add_(p.grad, alpha=-MAML_INNER_LR)
-
-    # Clear the inner-loop grads: the caller's optimizer.zero_grad()
-    # already ran before this point, so leftovers here would ride
-    # along into the outer backward and pollute the real step.
-    for p in params:
-        p.grad = None
-
-    def restore() -> None:
-        # .data for the same version-counter reason as the SGD step
-        # above: maml_pred's graph (and the pre-MAML graphs) still
-        # reference these params when the outer backward runs. The
-        # backward then reads the restored values where it needs the
-        # weights - an O(MAML_INNER_LR) difference, see docstring.
-        for p, sv in zip(params, saved):
-            p.data.copy_(sv)
-
-    return restore
+        inner_opt.step()
+    return fast

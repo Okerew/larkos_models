@@ -1,3 +1,4 @@
+import copy
 import ctypes
 import math
 from pathlib import Path
@@ -26,48 +27,19 @@ from modules.strategies import (
     build_neuron_prediction,
     derive_lr, derive_alpha_from_context,
     derive_alpha_from_params, update_optimizer_lr,
-    maml_inner_update, bf16_autocast,
+    maml_inner_update,
 )
 from modules.fusion_mechanism.fusion import cognitive_fuse
 from modules.logging_utils import (
     log_epoch, log_context, log_history, log_memory,
 )
 
-from modules.data_pipeline import TextDataPipeline, ListDataPipeline
+from modules.data_pipeline import TextDataPipeline
 
 from modules.verify import run_verification, LearningPatternTracker
 
 from modules.checkpoint import save_checkpoint, load_checkpoint
 from modules.epoch_controller import EpochController
-
-import modules.output_prompt as output_prompt
-import modules.memory_journal as memory_journal
-
-try:
-    import bitsandbytes as _bnb
-except ImportError:
-    _bnb = None
-
-
-def _make_adamw(params, **kwargs) -> torch.optim.Optimizer:
-    """
-    bitsandbytes 8-bit AdamW on CUDA - identical update rule but the
-    two moment buffers are block-quantised to 8 bits, so optimizer
-    state costs ~1/4 of the fp32 version (~1.7 GB instead of ~6.4 GB
-    at 805M params). On a GPU box a missing bitsandbytes is a HARD
-    error: the silent fp32 fallback OOMs at the first optimizer.step
-    on a 12 GB card. CPU-only boxes (unit tests) keep torch AdamW.
-    """
-    if torch.cuda.is_available():
-        if _bnb is None:
-            raise RuntimeError(
-                "bitsandbytes is required for CUDA training at this "
-                "model size - the fp32 AdamW fallback does not fit "
-                "in VRAM. Install it with: pip install bitsandbytes"
-            )
-        return _bnb.optim.AdamW8bit(params, **kwargs)
-    return torch.optim.AdamW(params, **kwargs)
-
 
 def _build_embed_ctx(ctx: dict) -> str:
     """
@@ -661,14 +633,10 @@ class _NeuronGraphReasoner(nn.Module):
         # the training freeze cache can pin the *inputs* to the GAT
         # while still running the GAT in-graph on every step — this
         # keeps gradient flowing to GAT params during a freeze window
-        # without re-reading live neuron state. The dtype-aware cast
-        # is a no-op for training's fp32 masters; the runner builds
-        # this reasoner in bf16 so the fp32 CPU tensors have to be
-        # cast at the boundary.
-        _dt = self.node_in.weight.dtype
-        node_features = node_features.to(DEVICE, _dt)
+        # without re-reading live neuron state.
+        node_features = node_features.to(DEVICE)
         adj_mask      = adj_mask.to(DEVICE)
-        edge_weight   = edge_weight.to(DEVICE, _dt)
+        edge_weight   = edge_weight.to(DEVICE)
 
         h = self.node_in(node_features).unsqueeze(0)        # [1, N, d_out]
         h = h + self.neuron_embed.unsqueeze(0)              # per-neuron embed
@@ -876,13 +844,6 @@ class _TextCodec:
         self.lm = GPT2LMHeadModel.from_pretrained("distilgpt2")
         self.lm.eval()
         self.lm.to(device)
-        # bf16 halves the codec's VRAM footprint. It is frozen, eval
-        # and only ever read under no_grad (debug readout + text
-        # encoding). CPU boxes keep fp32 - half matmuls there are
-        # slow and some ops are unsupported.
-        if torch.device(device).type == "cuda":
-            self.lm.to(torch.bfloat16)
-        self._lm_dtype = next(self.lm.parameters()).dtype
         for p in self.lm.parameters():
             p.requires_grad_(False)
 
@@ -914,10 +875,7 @@ class _TextCodec:
             hidden = self.lm.transformer(
                 ids, attention_mask=mask
             ).last_hidden_state
-        # .float() keeps text_encoding fp32 for every downstream
-        # consumer (text_proj, cognitive_fuse) regardless of the
-        # codec's own bf16 weights
-        return hidden.mean(dim=1).squeeze(0).float()
+        return hidden.mean(dim=1).squeeze(0)
 
     def _prefix_from_numeric(
         self,
@@ -945,10 +903,6 @@ class _TextCodec:
         # GPT-2 to emit the same noise every epoch — skip generation.
         if prefix.std().item() < 1e-3:
             return ""
-
-        # _num_to_prefix is fp32; the (possibly bf16) LM embeddings it
-        # gets concatenated with below must share its dtype
-        prefix = prefix.to(self._lm_dtype)
 
         if anchor_text:
             # Anchor the generation on the real driver sentence so
@@ -1098,15 +1052,12 @@ class TrainingLoop:
         resume_from: str | None = None,
         resume_use_ema: bool = False,
         resume_memory_from: str | None = None,
-        texts: list[str] | None = None,
-        keep_journal: bool = False,
     ) -> None:
         self.backend       = backend
         self.epochs        = epochs
         # Caller-supplied alpha used as a starting override on epoch 1;
         # after that, per-epoch context derivation takes over.
         self.initial_alpha = initial_alpha
-        self.keep_journal  = keep_journal
 
         neurons      = backend.get_neurons()
         input_tensor = backend.get_input_tensor()
@@ -1117,10 +1068,13 @@ class TrainingLoop:
         self.model     = LarkosModel().to(DEVICE)
         self.ema       = EMAWrapper(self.model)
 
-        # MAML no longer keeps a persistent fast clone: at the 1B
-        # scale the inner loop saves/restores the trainable params on
-        # self.model itself (strategies.maml_inner_update), so there
-        # is no second weight copy on the GPU.
+        # Persistent MAML clone, built once and refreshed via param
+        # copy each inner update. We deepcopy self.model here so the
+        # EmbeddingProjector.__deepcopy__ override fires — that shares
+        # the frozen 22M-param MiniLM with self.model rather than
+        # loading a second copy. From this point on the inner update
+        # only copies the small trainable subset, not the ST encoder.
+        self.fast_model = copy.deepcopy(self.model).to(DEVICE)
 
         # Temporal encoder runs on the [TEMPORAL_WINDOW, FOURIER_OUT_DIM]
         # input history before it is flattened for LarkosModel, giving
@@ -1150,15 +1104,9 @@ class TrainingLoop:
         self.fused_cog_norm  = _OnlineMeanStd(FUSION_DIM)
         self.text_codec      = _TextCodec(DEVICE)
 
-        # LLM-supplied texts take priority over the HF data dir so
-        # service-side train calls never depend on the data/ folder.
         self._data_pipeline = (
-            ListDataPipeline(texts) if texts is not None
-            else (
-                TextDataPipeline(Path(data_dir))
-                if data_dir is not None
-                else TextDataPipeline()
-            )
+            TextDataPipeline(Path(data_dir)) if data_dir is not None
+            else TextDataPipeline()
         )
 
         self._sample_pool: list[str] = []
@@ -1205,10 +1153,8 @@ class TrainingLoop:
         # AdamW (decoupled weight decay) instead of Adam — Adam folds
         # WD into the gradient before adaptive scaling, which under-
         # regularizes; AdamW applies it directly to the weights and is
-        # the correct interpretation of weight_decay=1e-4. The 8-bit
-        # bitsandbytes variant (see _make_adamw) keeps the same
-        # hyperparameters while quartering optimizer-state VRAM.
-        self.optimizer = _make_adamw(
+        # the correct interpretation of weight_decay=1e-4.
+        self.optimizer = torch.optim.AdamW(
             list(self.model.parameters())
             + list(self.fusion_transformer.parameters())
             + list(self.graph_reasoner.parameters())
@@ -1422,10 +1368,7 @@ class TrainingLoop:
             )
         else:
             self._cached_fused_cog = fused_cog_raw.detach()
-            # .float() so the cache is dtype-stable across epochs: the
-            # verifier block re-feeds it to fusion_transformer OUTSIDE
-            # autocast, where a bf16 driver would mismatch fp32 weights
-            self._cached_driver    = llm_embed_ca.detach().float()
+            self._cached_driver    = llm_embed_ca.detach()
             # Build the GAT inputs from live neurons exactly once per
             # freeze window (here, at refresh). This also advances the
             # reasoner's _prev_states buffer so per-neuron velocity is
@@ -1474,8 +1417,8 @@ class TrainingLoop:
             neuron_pred, dtype=torch.float32
         ).to(DEVICE).unsqueeze(0)
 
-        # MAML inner loop via save/restore on self.model (no clone at
-        # this scale - see strategies.maml_inner_update).
+        # MAML inner loop on the persistent fast_model clone (built
+        # once in __init__, refreshed via param copy each epoch).
         # We detach x_temporal here because MAML's inner loop calls
         # loss.backward() inside maml_inner_update, which would
         # otherwise walk back through the shared temporal_encoder /
@@ -1486,21 +1429,15 @@ class TrainingLoop:
         # correct: temporal_encoder still gets gradient via model_pred
         # in the outer loss.
         x_temporal_for_maml = x_temporal.detach().unsqueeze(0)
-        restore_params = maml_inner_update(
+        adapted   = maml_inner_update(
             self.model,
+            self.fast_model,
             x_temporal_for_maml,
             target,
             self.criterion,
             embed_ctx,
         )
-        maml_pred = self.model(x_temporal_for_maml, embed_ctx)
-        # Restore the pre-adaptation weights BEFORE returning so the
-        # outer optimizer / EMA / verifier all see the real model. The
-        # outer-loss grad through maml_pred still lands on the params
-        # (evaluated at the adapted point, FOMAML semantics); the
-        # restore-vs-adapted difference the backward recompute sees is
-        # O(MAML_INNER_LR) - 3 tiny SGD steps - and negligible.
-        restore_params()
+        maml_pred = adapted(x_temporal_for_maml, embed_ctx)
         # NOTE: we do NOT fuse maml_pred with neuron_pred (the target)
         # here doing so would let target information leak into the
         # outer loss, letting the model appear to improve by relying
@@ -1533,73 +1470,68 @@ class TrainingLoop:
         refresh delivers a shock — that pulse is the sawtooth seen in
         the loss logs.
         """
-        # Same bf16 autocast as the forward: the preds arrive as bf16
-        # leaves, aux_proj re-runs in-graph here, and loss.backward()
-        # fires OUTSIDE the context (standard autocast pattern - the
-        # backward graph replays the dtypes recorded in forward).
-        with bf16_autocast():
-            raw_blend = float(
-                max(0.5 - fwd.mc_variance * 0.5, 0.1)
-            )
-            self._mc_blend_ema = (
-                0.9 * self._mc_blend_ema + 0.1 * raw_blend
-            )
-            mc_blend = self._mc_blend_ema
+        raw_blend = float(
+            max(0.5 - fwd.mc_variance * 0.5, 0.1)
+        )
+        self._mc_blend_ema = (
+            0.9 * self._mc_blend_ema + 0.1 * raw_blend
+        )
+        mc_blend = self._mc_blend_ema
 
-            # No tanh it saturates gradients when model outputs drift
-            # beyond ~±2.  Targets are left unscaled so the model head
-            # converges naturally over more epochs.
-            model_pred = fwd.model_pred
-            fused      = fwd.fused
-            maml_pred  = fwd.maml_pred
+        # No tanh it saturates gradients when model outputs drift
+        # beyond ~±2.  Targets are left unscaled so the model head
+        # converges naturally over more epochs.
+        model_pred = fwd.model_pred
+        fused      = fwd.fused
+        maml_pred  = fwd.maml_pred
 
-            scaled_target = fwd.target
-            outer_loss = self._vec_loss(maml_pred, scaled_target)
-            base_loss  = self._vec_loss(fused, scaled_target)
-            pred_loss  = self._vec_loss(model_pred, scaled_target)
+        scaled_target = fwd.target
+        outer_loss = self._vec_loss(maml_pred, scaled_target)
+        base_loss  = self._vec_loss(fused, scaled_target)
+        pred_loss  = self._vec_loss(model_pred, scaled_target)
 
-            # cross_attn, embed_weight_net and text_proj sit behind
-            # cognitive_fuse which breaks the graph (C boundary). aux_loss
-            # carries the gradient signal for those modules. We project the
-            # cross-attention embedding DOWN to the target dim and regress
-            # it against the target a real objective that can actually fall 
-            ca_pred  = self.aux_proj(fwd.llm_embed_ca.unsqueeze(0))
-            aux_loss = self._vec_loss(ca_pred, fwd.target)
+        # cross_attn, embed_weight_net and text_proj sit behind
+        # cognitive_fuse which breaks the graph (C boundary). aux_loss
+        # carries the gradient signal for those modules. We project the
+        # cross-attention embedding DOWN to the target dim and regress
+        # it against the target a real objective that can actually fall 
+        ca_pred  = self.aux_proj(fwd.llm_embed_ca.unsqueeze(0))
+        aux_loss = self._vec_loss(ca_pred, fwd.target)
 
+        print(
+            f"outer={outer_loss.item():.4f} "
+            f"base={base_loss.item():.4f} "
+            f"pred={pred_loss.item():.4f} "
+            f"aux={aux_loss.item():.4f} "
+            f"mc_blend={mc_blend:.4f}"
+        )
+
+        loss = (
+            mc_blend           * outer_loss
+            + (1.0 - mc_blend) * 0.4 * base_loss
+            + (1.0 - mc_blend) * 0.3 * pred_loss
+            + 0.2              * aux_loss
+        )
+
+        if epoch == 1:
             print(
-                f"outer={outer_loss.item():.4f} "
-                f"base={base_loss.item():.4f} "
-                f"pred={pred_loss.item():.4f} "
-                f"aux={aux_loss.item():.4f} "
-                f"mc_blend={mc_blend:.4f}"
+                f"  loss components — "
+                f"outer={outer_loss.item():.4f}  "
+                f"base={base_loss.item():.4f}  "
+                f"pred={pred_loss.item():.4f}  "
+                f"aux={aux_loss.item():.4f}  "
+                f"lr={self.optimizer.param_groups[0]['lr']:.6f}"
             )
 
-            loss = (
-                mc_blend           * outer_loss
-                + (1.0 - mc_blend) * 0.4 * base_loss
-                + (1.0 - mc_blend) * 0.3 * pred_loss
-                + 0.2              * aux_loss
-            )
+        loss_val = float(loss.item())
 
-            if epoch == 1:
-                print(
-                    f"  loss components — "
-                    f"outer={outer_loss.item():.4f}  "
-                    f"base={base_loss.item():.4f}  "
-                    f"pred={pred_loss.item():.4f}  "
-                    f"aux={aux_loss.item():.4f}  "
-                    f"lr={self.optimizer.param_groups[0]['lr']:.6f}"
-                )
-
-            loss_val = float(loss.item())
-
-            # Skip the step on an already-learned frozen pair. We are some
-            # epochs into the freeze window (not the refresh epoch) and the
-            # loss is below the floor, so stepping again only memorises
-            # harder and produces the grad pulse / sawtooth artefact.
-            in_frozen_window = (epoch - self._target_epoch) > 0
-            if in_frozen_window and loss_val < self._frozen_skip_floor:
-                return loss_val, base_loss.item()
+        # Skip the step on an already-learned frozen pair. We are some
+        # epochs into the freeze window (not the refresh epoch) and the
+        # loss is below the floor, so stepping again only memorises
+        # harder and produces the grad pulse / sawtooth artefact.
+        in_frozen_window = (epoch - self._target_epoch) > 0
+        if in_frozen_window and loss_val < self._frozen_skip_floor:
+            return loss_val, base_loss.item()
 
         loss.backward()
 
@@ -1695,24 +1627,10 @@ class TrainingLoop:
         )
         print(f"  [epoch {epoch}] text_output : {text_output}")
 
-        mem_step = self.backend.add_memory_step(fused_np.tolist())
-        # The journal keys on the same step counter the C side stamps
-        # entries with, so every vector gets its driver text attached;
-        # the MiniLM embedding rides along for semantic recall
-        emb = memory_journal.encode_cached(
-            self._current_text_input,
-            lambda t: self.model.embedder._st.encode(
-                t, convert_to_numpy=True
-            ),
-        )
-        memory_journal.record(
-            mem_step["step"], self._current_text_input, emb
-        )
+        self.backend.add_memory_step(fused_np.tolist())
 
-        # Post-epoch meta update gets the freshest performance read;
-        # the run() feed above carries the previous epoch's.
         updated_meta = self.backend.update_meta(
-            [1.0 - min(loss_val, 1.0)] * NUM_REGIONS
+            region_scores
         )
         _ = updated_meta
 
@@ -1893,30 +1811,12 @@ class TrainingLoop:
         )
         log_context(self.backend.get_context_state())
         log_history(self.backend.get_network_history())
-        mem_state = self.backend.get_memory_state()
-        log_memory(mem_state)
+        log_memory(self.backend.get_memory_state())
 
         result = self.backend.receive_predictions(
             epoch, neuron_pred.tolist(), fused_np.tolist()
         )
         print(f"backend ack : {result}")
-
-        output_prompt.capture_training_state(
-            epoch           = epoch,
-            loss_val        = loss_val,
-            lr              = lr,
-            alpha           = alpha,
-            text_input      = self._current_text_input,
-            text_output     = text_output,
-            fused_cog       = self._last_fused_cog,
-            fused_np        = fused_np,
-            model_pred_np   = model_pred_np,
-            neuron_pred     = neuron_pred,
-            backend         = self.backend,
-            mem_state       = mem_state,
-            reflect_metrics = reflect_metrics,
-            stability       = self._last_dyn_stability,
-        )
 
     def start_training_from(
         self,
@@ -1945,12 +1845,8 @@ class TrainingLoop:
         Use resume_memory_from only when resuming the exact same
         architecture.
         """
-        # map_location cpu - same reasoning as load_checkpoint: don't
-        # transiently pin the whole old checkpoint on the GPU next to
-        # the freshly built model; the per-param .to(DEVICE) below
-        # moves only what actually transfers.
         ckpt = torch.load(
-            model_path, map_location="cpu", weights_only=False
+            model_path, map_location=DEVICE, weights_only=False
         )
 
         transferred = 0
@@ -2015,16 +1911,12 @@ class TrainingLoop:
             for k, new_v in self.ema.shadow.items():
                 if k not in old_shadow:
                     continue
-                # shadow lives on CPU (EMAWrapper keeps it there to
-                # save VRAM), so the partial copy lands on CPU too
-                old_v = old_shadow[k].cpu()
+                old_v = old_shadow[k].to(DEVICE)
                 if old_v.shape == new_v.shape:
                     self.ema.shadow[k] = old_v
                 else:
                     try:
-                        self.ema.shadow[k] = _expand_copy(
-                            new_v.cpu(), old_v
-                        )
+                        self.ema.shadow[k] = _expand_copy(new_v, old_v)
                     except Exception:
                         pass
 
@@ -2053,20 +1945,6 @@ class TrainingLoop:
         return {"transferred": transferred, "skipped": skipped}
 
     def run(self) -> None:
-        output_prompt.reset()
-        if self.keep_journal:
-            # Incremental training on a live memory: keep the journal
-            # instead of wiping it, and bump the C-side step counter
-            # past every timestamp the journal + memory tiers already
-            # hold (same trick Reminiscence.memorize uses for its
-            # writes) so new journal keys never collide with old ones
-            # and the tier joins stay valid.
-            memory_journal.load()
-            self.backend._step_counter = (
-                memory_journal.next_timestamp(self.backend)
-            )
-        else:
-            memory_journal.reset()
         # Seed the optimizer LR once from the first meta read so
         # derive_lr()'s initial value is respected, then the scheduler
         # owns all subsequent adjustments no more per-epoch override
@@ -2106,15 +1984,7 @@ class TrainingLoop:
             if self.initial_alpha is not None:
                 alpha = (alpha + self.initial_alpha) * 0.5
 
-            # region_scores feeds the metacog performance history, so
-            # it must carry a performance signal - feeding alpha froze
-            # the whole meta layer at a constant ~0.41. At this point
-            # the freshest performance read is the previous epoch's.
-            prev_perf = (
-                1.0 - min(self.prev_loss, 1.0)
-                if self.loss_history else 0.5
-            )
-            region_scores = [prev_perf] * NUM_REGIONS
+            region_scores = [alpha] * NUM_REGIONS
             self.backend.run_decision_path(region_scores)
             self.backend.update_context()
 
@@ -2283,22 +2153,19 @@ class TrainingLoop:
             self.model.train()
             self.optimizer.zero_grad()
 
-            # bf16 autocast over the whole differentiable pass; master
-            # weights, grads and the optimizer stay fp32
-            with bf16_autocast():
-                fwd = self._forward(
-                    x_temporal       = x_temporal,
-                    x_norm           = x_norm,
-                    embed_ctx        = embed_ctx,
-                    neurons          = neurons,
-                    neuron_pred      = neuron_pred,
-                    mem_state        = mem_state,
-                    default_weights  = default_weights,
-                    mem_weight_ratio = mem_weight_ratio,
-                    alpha            = alpha,
-                    exploration_rate = exploration_rate,
-                    epoch            = epoch,
-                )
+            fwd = self._forward(
+                x_temporal       = x_temporal,
+                x_norm           = x_norm,
+                embed_ctx        = embed_ctx,
+                neurons          = neurons,
+                neuron_pred      = neuron_pred,
+                mem_state        = mem_state,
+                default_weights  = default_weights,
+                mem_weight_ratio = mem_weight_ratio,
+                alpha            = alpha,
+                exploration_rate = exploration_rate,
+                epoch            = epoch,
+            )
 
             # ---- backward ----
             loss_val, base_loss_val = self._backward(fwd, epoch)
@@ -2468,10 +2335,8 @@ class TrainingLoop:
                 )
 
             # ---- side-effects (no grad) ----
-            # .float() before .numpy(): under bf16 autocast these are
-            # bfloat16 tensors and numpy has no bf16 dtype
             fused_np  = (
-                fwd.fused.squeeze(0).detach().cpu().float().numpy()
+                fwd.fused.squeeze(0).detach().cpu().numpy()
             )
             fused_vec = fwd.fused.squeeze(0).detach()
 
@@ -2486,7 +2351,7 @@ class TrainingLoop:
                 fused_vec     = fused_vec,
                 input_tensor  = input_tensor,
                 model_pred_np = (
-                    fwd.model_pred.detach().cpu().float().numpy()
+                    fwd.model_pred.detach().cpu().numpy()
                 ),
                 neuron_pred   = neuron_pred_live,
                 region_scores = region_scores,
@@ -2521,8 +2386,6 @@ class TrainingLoop:
         # --- post-training ---
         self.backend.consolidate_memory()
         self.backend.save_memory("memory.bin")
-        journal_result = memory_journal.save()
-        print(f"  journal    : {journal_result}")
         self.backend.save_network_states()
 
         # Torch-side state pairs with the C-side saves above; both
@@ -2548,9 +2411,7 @@ def training_loop(
     resume_use_ema: bool = False,
     resume_memory_from: str | None = None,
     start_from: str | None = None,
-    texts:    list[str] | None = None,
-    keep_journal: bool = False,
-) -> "TrainingLoop":
+) -> None:
     """
     epochs      : fixed epoch count (legacy behaviour, the test
                   framework relies on it) or None for dynamic control -
@@ -2563,16 +2424,6 @@ def training_loop(
                   from pre_model.pt). Memory binaries cannot be transferred
                   across architecture changes; use resume_memory_from only
                   when the architecture is identical.
-    texts       : explicit training texts (the LLM-supplied path); when
-                  given, a ListDataPipeline cycles over them instead of
-                  reading the HF data dir. One text is consumed per epoch
-                  until the sample pool fills.
-    keep_journal: keep and extend the existing journal instead of
-                  resetting it - incremental training on a live memory.
-                  The step counter is bumped past every existing
-                  timestamp so new journal keys never collide.
-    Returns the finished TrainingLoop so callers (the memory service)
-    can read loss_history and friends after run().
     """
     loop = TrainingLoop(
         backend,
@@ -2582,10 +2433,7 @@ def training_loop(
         resume_from=resume_from,
         resume_use_ema=resume_use_ema,
         resume_memory_from=resume_memory_from,
-        texts=texts,
-        keep_journal=keep_journal,
     )
     if start_from is not None:
         loop.start_training_from(start_from)
     loop.run()
-    return loop

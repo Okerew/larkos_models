@@ -19,13 +19,8 @@ from modules.training import (
     _OnlineMinMax, _OnlineMeanStd, _TextCodec,
     _build_embed_ctx, fourier_encode,
 )
-from modules.fusion_mechanism.fusion import (
-    cognitive_fuse, mem_entries_from_c,
-)
+from modules.fusion_mechanism.fusion import cognitive_fuse
 from modules.checkpoint import load_checkpoint
-
-import modules.output_prompt as output_prompt
-import modules.memory_journal as memory_journal
 
 
 
@@ -49,47 +44,28 @@ class LarkosRunner:
         ckpt_path:  str  = "larkos_model.pt",
         mem_path:   str  = "memory.bin",
         use_ema:    bool = True,
-        half:       bool | None = None,
     ) -> None:
-        if half is None:
-            half = DEVICE.type == "cuda"
         self.backend = backend
-        self._mem_path = mem_path
 
-        # Built on CPU first: casting to bf16 before the .to(DEVICE)
-        # means the card never sees the fp32 copy (~3.2 GB for the
-        # 805M stack) - the checkpoint load casts through copy_ and
-        # the fp32 master checkpoint maps to CPU anyway. Inference
-        # is eval + no_grad only, so bf16 is safe here; training
-        # keeps building its own fp32 stack.
-        self.model = LarkosModel()
+        self.model = LarkosModel().to(DEVICE)
         self.ema   = EMAWrapper(self.model)
 
         # Same instantiation order as TrainingLoop so load_checkpoint
         # restores onto matching attribute names without special-casing.
-        self.temporal_encoder = _TemporalAttentionEncoder()
-        self.graph_reasoner = _NeuronGraphReasoner()
+        self.temporal_encoder = _TemporalAttentionEncoder().to(DEVICE)
+        self.graph_reasoner = _NeuronGraphReasoner().to(DEVICE)
         self.fusion_transformer = _FusionTransformerHead(
             output_dim=self.model.output_dim
-        )
+        ).to(DEVICE)
         self.embed_weight_net = _EmbedWeightNet(
             INPUT_SIZE, INTERNAL_DIM
-        )
+        ).to(DEVICE)
         self.cross_attn = _InputCrossAttention(
             INPUT_SIZE, INTERNAL_DIM
-        )
+        ).to(DEVICE)
         self.text_proj = torch.nn.Linear(
             self.text_proj_in_dim(), INTERNAL_DIM
-        )
-
-        for module in (
-            self.model, self.temporal_encoder, self.graph_reasoner,
-            self.fusion_transformer, self.embed_weight_net,
-            self.cross_attn, self.text_proj,
-        ):
-            if half:
-                module.to(torch.bfloat16)
-            module.to(DEVICE)
+        ).to(DEVICE)
 
         self.online_norm    = _OnlineMinMax(INPUT_SIZE)
         self.fused_cog_norm = _OnlineMeanStd(FUSION_DIM)
@@ -126,8 +102,6 @@ class LarkosRunner:
         # cognitive_fuse sees the trained neuron / memory landscape.
         mem_result = self.backend.load_memory(mem_path)
         print(f"  memory load: {mem_result}")
-        journal_result = memory_journal.load()
-        print(f"  journal    : {journal_result}")
         net_result = self.backend.load_network_states()
         print(f"  net load   : {net_result}")
 
@@ -185,15 +159,7 @@ class LarkosRunner:
         # (motivation, emotion, identity, specialization, bond, memory
         # writes) stay out — they belong to the gradient loop, not the
         # readout.
-        # Inference has no loss signal, so feeding alpha as the meta
-        # performance read registers as a collapse (error_awareness
-        # spikes to ~0.5). Feed the metacog's own last performance
-        # value instead: a neutral "nothing changed" signal.
-        hist = self.backend.get_meta_state()["metacognition"][
-            "performance_history"
-        ]
-        neutral = hist[-1] if hist and hist[-1] > 0.0 else 0.5
-        region_scores = [neutral] * NUM_REGIONS
+        region_scores = [alpha] * NUM_REGIONS
         self.backend.run_decision_path(region_scores)
         self.backend.update_context()
         self.backend.process_neurons(scaled_factor=0.6)
@@ -259,10 +225,7 @@ class LarkosRunner:
 
         embed_ctx    = _build_embed_ctx(ctx)
         neurons      = self.backend.get_neurons()
-        # fusion reads the C-side tiers straight from the structs -
-        # the old get_memory_state() here built ~30k Python dicts
-        # every single step just to copy them into ctypes again
-        mem_entries  = mem_entries_from_c(self.backend.mem_sys)
+        mem_state    = self.backend.get_memory_state()
         input_tensor = self.backend.get_input_tensor()
         print(
             f"  step: input_tensor "
@@ -288,10 +251,7 @@ class LarkosRunner:
         x_seq = torch.stack(
             [t.to(DEVICE) for t in padded], dim=0
         )
-        # module dtype (bf16 on cuda, fp32 on cpu) - every tensor
-        # entering a half module has to be cast at the boundary
-        _mdt = self.text_proj.weight.dtype
-        x_seq = self.temporal_encoder(x_seq.to(_mdt))
+        x_seq = self.temporal_encoder(x_seq)
         x_temporal = x_seq.reshape(-1)
         print(
             f"  step: x_temporal shape={tuple(x_temporal.shape)} "
@@ -313,12 +273,12 @@ class LarkosRunner:
 
         llm_embed_raw = model_pred.squeeze(0)
         llm_embed     = llm_embed_raw[:INTERNAL_DIM]
-        embed_gate    = self.embed_weight_net(x_norm.to(_mdt))
+        embed_gate    = self.embed_weight_net(x_norm)
         llm_embed_g   = llm_embed * embed_gate
-        llm_embed_ca  = self.cross_attn(x_norm.to(_mdt), llm_embed_g)
+        llm_embed_ca  = self.cross_attn(x_norm, llm_embed_g)
 
         text_proj_out = self.text_proj(
-            self.text_encoding.to(DEVICE, _mdt)
+            self.text_encoding.to(DEVICE)
         )
         llm_embed_ca = (
             llm_embed_ca
@@ -329,7 +289,7 @@ class LarkosRunner:
         fused_cog_raw = cognitive_fuse(
             llm_embed        = llm_embed_ca.detach(),
             neurons          = neurons,
-            mem_entries      = mem_entries,
+            mem_state        = mem_state,
             default_weights  = default_weights,
             mem_weight_ratio = mem_weight_ratio,
             context_factor   = alpha,
@@ -358,8 +318,8 @@ class LarkosRunner:
         )
         fused = self.fusion_transformer(
             graph_tokens = graph_tokens,
-            band_q       = band_q_in.to(_mdt),
-            band_m       = band_m_in.to(_mdt),
+            band_q       = band_q_in,
+            band_m       = band_m_in,
             driver       = llm_embed_ca.unsqueeze(0),
             frozen_input = False,
         )
@@ -393,11 +353,8 @@ class LarkosRunner:
         )
 
         return {
-            # .float() keeps the returned numpy arrays fp32 for every
-            # downstream consumer regardless of the bf16 modules
-            "fused":       fused_vec.float().cpu().numpy(),
-            "fused_cog":   fused_cog_for_decode.float().cpu().numpy(),
-            "model_pred":  model_pred.squeeze(0).float().cpu().numpy(),
+            "fused":       fused_vec.cpu().numpy(),
+            "model_pred":  model_pred.squeeze(0).cpu().numpy(),
             "text_input":  self._current_text_input,
             "text_output": text_output,
         }
@@ -415,13 +372,8 @@ def run_model(
         backend, ckpt_path, mem_path, use_ema=use_ema
     )
     results = []
-    for step_idx in range(steps):
+    for _ in range(steps):
         out = runner.step(text_input=text_input)
         print(f"  text_output: {out['text_output']}")
-        output_prompt.record_inference_step(
-            step_idx, out, runner.backend
-        )
         results.append(out)
-    output_prompt.finalize()
     return results
-
