@@ -59,10 +59,7 @@ def next_timestamp(backend) -> int:
     training-time timestamps, so writing without bumping would
     collide with existing journal keys and tier joins."""
     ts = [int(k) for k in _entries.keys()]
-    mem = backend.get_memory_state()
-    for level in ("short_term", "medium_term", "long_term"):
-        for e in mem.get(level, {}).get("entries", []):
-            ts.append(int(e.get("timestamp", -1)))
+    ts.extend(t for _, t, _ in backend.get_entry_meta())
     return max(ts, default=-1) + 1
 
 
@@ -156,35 +153,31 @@ class Reminiscence:
         )
 
     def _ts_map(self) -> dict:
-        mem = self.runner.backend.get_memory_state()
-        ts_map = {}
-        for level in ("short_term", "medium_term", "long_term"):
-            for e in mem.get(level, {}).get("entries", []):
-                ts_map[int(e.get("timestamp", -1))] = (
-                    level, float(e.get("importance", 0.0))
-                )
-        return ts_map
+        return {
+            ts: (level, imp)
+            for level, ts, imp in
+            self.runner.backend.get_entry_meta()
+        }
 
     def _recall_state(self, query: str, top_k: int) -> list[dict]:
         self.runner.step(text_input=query)
         state = self._state_vector()
-        mem = self.runner.backend.get_memory_state()
 
         cands = []
-        for level in ("short_term", "medium_term", "long_term"):
-            for e in mem.get(level, {}).get("entries", []):
-                v = np.asarray(e.get("vector", []), dtype=np.float32)
-                if v.shape != state.shape:
-                    continue
-                norms = np.linalg.norm(v) * np.linalg.norm(state)
-                if norms < 1e-8:
-                    continue
-                cands.append({
-                    "similarity": float(v @ state / norms),
-                    "tier":       level,
-                    "importance": float(e.get("importance", 0.0)),
-                    "timestamp":  int(e.get("timestamp", -1)),
-                })
+        for level, ts, imp, v in (
+            self.runner.backend.get_entry_views()
+        ):
+            if v.shape != state.shape:
+                continue
+            norms = np.linalg.norm(v) * np.linalg.norm(state)
+            if norms < 1e-8:
+                continue
+            cands.append({
+                "similarity": float(v @ state / norms),
+                "tier":       level,
+                "importance": imp,
+                "timestamp":  ts,
+            })
         cands.sort(key=lambda c: -c["similarity"])
 
         out = []
