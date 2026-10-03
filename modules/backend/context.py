@@ -40,6 +40,7 @@ def bind(lib: CDLL):
         POINTER(c_float),
         c_uint32,
         POINTER(c_float),
+        c_uint32,
     ]
     lib.updateGlobalContext.restype = None
 

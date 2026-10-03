@@ -137,6 +137,9 @@ def bind(lib: CDLL):
     lib.consolidateMemory.argtypes = [POINTER(MemorySystem)]
     lib.consolidateMemory.restype  = None
 
+    lib.decayMemorySystem.argtypes = [POINTER(MemorySystem)]
+    lib.decayMemorySystem.restype  = None
+
     lib.addToDirectMemory.argtypes = [
         POINTER(MemorySystem),
         POINTER(MemoryEntry),
@@ -282,5 +285,4 @@ def serialize_state(mem_sys) -> dict:
         "medium_term": _level(ms.hierarchy.medium_term),
         "long_term":   _level(ms.hierarchy.long_term),
     }
-
 

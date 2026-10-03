@@ -290,6 +290,9 @@ CONTEXT_VECTOR_SIZE       = 1024
 # (backend_state.get_memory_stats) and serialize_state truncates
 # entry lists at MAX_SERIALIZED_ENTRIES per level.
 MEMORY_CAPACITY           = 1_000_000
+# decayMemorySystem every N add_memory steps so the tiers cycle
+# instead of filling forever (ST ~80 steps, MT ~740, LT ~1760)
+MEMORY_DECAY_INTERVAL     = 10
 
 # Self identity
 PATTERN_SIZE              = 3
@@ -375,11 +378,3 @@ JOURNAL_FILE = "memory_journal.json"
 # like it was ever stored. First calibration, tune with use.
 SUPPORT_SIM = 0.75
 RELATED_SIM = 0.45
-
-# Memory entries handed to the C-side cognitive_fuse, sampled by
-# importance. With MEMORY_CAPACITY at 1M the serialized tiers can
-# carry tens of thousands of entries; marshalling all of them through
-# ctypes every step is pure overhead when the fusion attention only
-# ever weighs the salient tail anyway. The C side already takes
-# m_count as a runtime arg, so no recompile is needed.
-FUSION_MEM_TOP_K = 1024
