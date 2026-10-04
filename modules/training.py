@@ -2083,10 +2083,6 @@ class TrainingLoop:
             if self._epoch_controller is None and epoch > self.epochs:
                 break
 
-            for name, p in self.model.named_parameters():
-                if p.grad is not None:
-                    print(name, p.grad.norm().item())
-
             # --- per-epoch backend state reads ---
             meta       = self.backend.get_meta_state()
             backend_lr = derive_lr(meta)            # The actual training LR is managed by the scheduler

@@ -378,3 +378,10 @@ JOURNAL_FILE = "memory_journal.json"
 # like it was ever stored. First calibration, tune with use.
 SUPPORT_SIM = 0.75
 RELATED_SIM = 0.45
+
+# memorize duplicate-write feedback: cosine at/above this against an
+# existing journal embedding means "you already stored essentially
+# this sentence" - the write still happens (the C side consolidates
+# by its own rules), but the response names the original entry so
+# the caller is not blindly piling up identical embeddings.
+DUPLICATE_SIM = 0.97
