@@ -2491,10 +2491,11 @@ void removeDecayedMemories(MemorySystem *system) {
                            system->hierarchy.medium_term.importance_threshold *
                                0.5f);
 
-  // Remove from long-term memory
+  // Remove from long-term memory (0.3 ratio: LT should be durable, a 0.41
+  // entry used to die in ~8 ticks which defeated the point of "long term")
   removeDecayedFromCluster(&system->hierarchy.long_term,
                            system->hierarchy.long_term.importance_threshold *
-                               0.5f);
+                               0.3f);
 }
 
 void decayMemorySystem(MemorySystem *system) {
@@ -2508,10 +2509,10 @@ void decayMemorySystem(MemorySystem *system) {
     system->hierarchy.medium_term.entries[i].importance *= DECAY_FACTOR;
   }
 
-  // Decay long-term memories slower (0.98 > 0.95 so they still drain,
-  // just slower than medium - the old DECAY_FACTOR * 1.1 was growth)
+  // Decay long-term memories slower (0.995 > 0.95 so they still drain,
+  // just much slower than medium - the old DECAY_FACTOR * 1.1 was growth)
   for (unsigned int i = 0; i < system->hierarchy.long_term.size; i++) {
-    system->hierarchy.long_term.entries[i].importance *= 0.98f;
+    system->hierarchy.long_term.entries[i].importance *= 0.995f;
   }
 
   // Remove decayed memories
