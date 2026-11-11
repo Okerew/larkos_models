@@ -19,10 +19,17 @@ import modules.backend.self_identity as identity
 import modules.backend.imagination as imagination
 import modules.backend.neuron_managment.specialization as specialization
 import modules.backend.emotional_affective as emotional
+import modules.backend.workspace as workspace
 
 from modules.config import (
     MAX_NEURONS, INPUT_SIZE, NUM_REGIONS,
     MAX_CONNECTIONS,     MEMORY_VECTOR_SIZE,
+    MEMORY_DECAY_INTERVAL,
+    WM_POOL_CAPACITY,
+    WM_MAX_SLOTS,
+    WM_LABEL_SIZE,
+    WM_TEXT_SIZE,
+    WM_HISTORY_SIZE,
     build_input_tensor,
 )
 
@@ -81,6 +88,7 @@ class BackendState:
         imagination.bind(lib)
         specialization.bind(lib, self.MAX_NEURONS, self.MAX_CONNECTIONS)
         emotional.bind(lib, self.MAX_NEURONS)
+        workspace.bind(lib)
 
         self.neurons = (Neuron * self.MAX_NEURONS)()
         self.connections = (c_uint * (self.MAX_NEURONS * self.MAX_CONNECTIONS))()
@@ -105,6 +113,7 @@ class BackendState:
 
         self.mem_sys = lib.createMemorySystem(memory.MEMORY_CAPACITY)
         self.work_mem = lib.createWorkingMemorySystem(memory.MEMORY_CAPACITY)
+        self.wm_pool = lib.createWorkspacePool()
         self.feature_proj = memory.FeatureMatrix()
 
         self.meta_ctrl = lib.initializeMetaController(self.NUM_REGIONS)
@@ -330,6 +339,8 @@ class BackendState:
         self.lib.consolidateToLongTermMemory(
             self.work_mem, self.mem_sys, c_uint(self._step_counter)
         )
+        if self._step_counter % MEMORY_DECAY_INTERVAL == 0:
+            self.lib.decayMemorySystem(self.mem_sys)
 
         if self._history_count < self.MAX_HISTORY:
             snap = self.state_history[self._history_count]
@@ -350,13 +361,26 @@ class BackendState:
         self.lib.consolidateMemory(self.mem_sys)
         return {"status": "consolidated"}
 
+    def _wm_pool_path(self, filename: str) -> str:
+        base = os.path.splitext(filename)[0]
+        return base + "_wm_pool.bin"
+
     def save_memory(self, filename: str = "memory.bin"):
         self.lib.saveMemorySystem(self.mem_sys, filename.encode())
+        self.lib.saveWorkspacePool(
+            self.wm_pool, self._wm_pool_path(filename).encode()
+        )
         return {"status": "saved", "file": filename}
 
     def load_memory(self, filename: str = "memory.bin"):
         self.lib.freeMemorySystem(self.mem_sys)
         self.mem_sys = self.lib.loadMemorySystem(filename.encode())
+        pool_path = self._wm_pool_path(filename)
+        if os.path.exists(pool_path):
+            restored = self.lib.loadWorkspacePool(pool_path.encode())
+            if restored:
+                self.lib.freeWorkspacePool(self.wm_pool)
+                self.wm_pool = restored
         return {"status": "loaded", "file": filename}
 
     def save_network_states(self):
@@ -382,6 +406,7 @@ class BackendState:
             cast(self.neurons, POINTER(c_float)),
             self.MAX_NEURONS,
             self.input_tensor_c,
+            c_uint32(self.INPUT_SIZE),
         )
         self.lib.integrateGlobalContext(
             self.ctx_mgr,
@@ -993,3 +1018,236 @@ class BackendState:
             c_float(valence),
         )
         return self.get_affective_state()
+
+    # --- WM runtime (workspace pool) ---
+
+    def _wm_vec(self, values):
+        arr = (c_float * MEMORY_VECTOR_SIZE)(
+            *([0.0] * MEMORY_VECTOR_SIZE)
+        )
+        for i, v in enumerate(list(values)[:MEMORY_VECTOR_SIZE]):
+            v = float(v)
+            arr[i] = 0.0 if (math.isnan(v) or math.isinf(v)) else v
+        return arr
+
+    def _wm_find(self, ws_id: int):
+        if not self.wm_pool:
+            return None
+        pool = self.wm_pool.contents
+        for i in range(WM_POOL_CAPACITY):
+            ws = pool.workspaces[i]
+            if ws.active and int(ws.workspace_id) == int(ws_id):
+                return ws
+        return None
+
+    @staticmethod
+    def _wm_label(slot_field) -> str:
+        return slot_field.decode(errors="replace").rstrip("\x00")
+
+    def wm_save_pool(self, filename: str = "memory.bin") -> dict:
+        path = self._wm_pool_path(filename)
+        self.lib.saveWorkspacePool(self.wm_pool, path.encode())
+        return {"status": "saved", "file": path}
+
+    def wm_status(self) -> dict:
+        return workspace.serialize_pool(self.wm_pool)
+
+    def wm_allocate(self, kind: int, query_vec=None) -> dict:
+        q = None
+        if query_vec is not None:
+            q = self._wm_vec(query_vec)
+        rc = self.lib.createWorkspace(
+            self.wm_pool,
+            c_uint(int(kind)),
+            cast(q, POINTER(c_float)) if q is not None else None,
+            self.mem_sys,
+            c_uint(self._step_counter),
+        )
+        return {"rc": int(rc)}
+
+    def wm_destroy(self, ws_id: int) -> dict:
+        rc = self.lib.destroyWorkspace(
+            self.wm_pool, c_uint(int(ws_id))
+        )
+        return {"rc": int(rc)}
+
+    def wm_slots(self, ws_id: int) -> list:
+        ws = self._wm_find(ws_id)
+        if ws is None:
+            return []
+        out = []
+        for i in range(WM_MAX_SLOTS):
+            s = ws.slots[i]
+            if not s.used:
+                continue
+            out.append({
+                "index": i,
+                "label": self._wm_label(s.label),
+                "text": self._wm_label(s.text),
+                "importance": round(float(s.importance), 6),
+                "step_tag": int(s.step_tag),
+            })
+        return out
+
+    def wm_write(
+        self, ws_id: int, label: str, text: str,
+        vector, importance: float,
+    ) -> dict:
+        v = self._wm_vec(vector)
+        rc = self.lib.writeSlot(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            label.encode()[:WM_LABEL_SIZE - 1],
+            (text or "").encode()[:WM_TEXT_SIZE - 1],
+            cast(v, POINTER(c_float)),
+            c_float(float(importance)),
+            c_uint(self._step_counter),
+        )
+        return {"rc": int(rc)}
+
+    def wm_transform(
+        self, ws_id: int, label: str, target_vec, alpha: float,
+    ) -> dict:
+        t = self._wm_vec(target_vec)
+        rc = self.lib.transformSlot(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            label.encode()[:WM_LABEL_SIZE - 1],
+            cast(t, POINTER(c_float)),
+            c_float(float(alpha)),
+            c_uint(self._step_counter),
+        )
+        return {"rc": int(rc)}
+
+    def wm_link(
+        self, ws_id: int, a: str, b: str,
+        link_type: str, weight: float,
+    ) -> dict:
+        rc = self.lib.linkSlots(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            a.encode()[:WM_LABEL_SIZE - 1],
+            b.encode()[:WM_LABEL_SIZE - 1],
+            (link_type or "").encode()[:WM_LABEL_SIZE - 1],
+            c_float(float(weight)),
+        )
+        return {"rc": int(rc)}
+
+    def wm_retrieve(self, ws_id: int, query_vec, k: int = 5) -> dict:
+        q = self._wm_vec(query_vec)
+        n = max(1, min(int(k), WM_MAX_SLOTS))
+        out_idx = (c_int * n)()
+        out_score = (c_float * n)()
+        rc = self.lib.wmRetrieve(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            cast(q, POINTER(c_float)),
+            c_int(n),
+            self.work_mem,
+            c_uint(self._step_counter),
+            out_idx,
+            out_score,
+            c_int(n),
+        )
+        if rc < 0:
+            return {"rc": int(rc), "hits": []}
+        ws = self._wm_find(ws_id)
+        hits = []
+        if ws is not None:
+            for i in range(int(rc)):
+                s = ws.slots[out_idx[i]]
+                hits.append({
+                    "label": self._wm_label(s.label),
+                    "score": round(float(out_score[i]), 6),
+                    "importance": round(float(s.importance), 6),
+                    "step_tag": int(s.step_tag),
+                })
+        return {"rc": int(rc), "hits": hits}
+
+    def wm_commit_slot(
+        self, ws_id: int, label: str, step: int, blend: float,
+    ) -> dict:
+        rc = self.lib.wmCommitSlot(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            label.encode()[:WM_LABEL_SIZE - 1],
+            self.mem_sys,
+            c_uint(int(step)),
+            c_float(float(blend)),
+        )
+        return {"rc": int(rc)}
+
+    def wm_validate(self, ws_id: int) -> dict:
+        labels = workspace.slot_labels(self.wm_pool, ws_id)
+        if not labels:
+            return {"rc": 0, "results": []}
+        n = len(labels)
+        out_idx = (c_int * n)()
+        out_flag = (c_int * n)()
+        out_coh = (c_float * n)()
+        out_cons = (c_float * n)()
+        rc = self.lib.wmValidateWorkspace(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            self.mem_sys,
+            out_idx,
+            out_flag,
+            out_coh,
+            out_cons,
+            c_int(n),
+        )
+        if rc < 0:
+            return {"rc": int(rc), "results": []}
+        by_index = {idx: label for idx, label, _ in labels}
+        flag_names = {
+            0: "ok",
+            1: "low_coherence",
+            2: "low_consistency",
+            3: "confabulated_dereferenced",
+            4: "confabulated_kept",
+        }
+        results = []
+        for i in range(int(rc)):
+            flag = int(out_flag[i])
+            results.append({
+                "label": by_index.get(int(out_idx[i]), "?"),
+                "flag": flag_names.get(flag, str(flag)),
+                "coherence": round(float(out_coh[i]), 6),
+                "consistency": round(float(out_cons[i]), 6),
+            })
+        return {"rc": int(rc), "results": results}
+
+    def wm_discard_slot(self, ws_id: int, label: str) -> dict:
+        imp = c_float(0.0)
+        rc = self.lib.wmDiscardSlot(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            label.encode()[:WM_LABEL_SIZE - 1],
+            byref(imp),
+            c_uint(self._step_counter),
+        )
+        return {"rc": int(rc), "importance": round(float(imp.value), 6)}
+
+    def wm_replay(
+        self, ws_id: int, from_step: int = 0, limit: int = 64,
+    ) -> dict:
+        n = max(1, min(int(limit), WM_HISTORY_SIZE))
+        out = (workspace.WMSlotSnapshot * n)()
+        rc = self.lib.replayWorkspace(
+            self.wm_pool,
+            c_uint(int(ws_id)),
+            c_uint(int(from_step)),
+            out,
+            c_int(n),
+        )
+        if rc < 0:
+            return {"rc": int(rc), "snapshots": []}
+        snaps = [
+            {
+                "step": int(out[i].step),
+                "label": self._wm_label(out[i].label),
+                "importance": round(float(out[i].importance), 6),
+            }
+            for i in range(int(rc))
+        ]
+        return {"rc": int(rc), "snapshots": snaps}

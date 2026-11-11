@@ -385,3 +385,39 @@ RELATED_SIM = 0.45
 # by its own rules), but the response names the original entry so
 # the caller is not blindly piling up identical embeddings.
 DUPLICATE_SIM = 0.97
+
+WM_POOL_CAPACITY = 8
+WM_TASK_CAP = 2
+WM_MAX_SLOTS = 64
+WM_MAX_LINKS = 128
+WM_LABEL_SIZE = 64
+WM_TEXT_SIZE = 256
+WM_HISTORY_SIZE = 256
+
+WM_KIND_SESSION = 0
+WM_KIND_GLOBAL = 1
+WM_KIND_TASK = 2
+
+WM_KIND_NAMES = {
+    WM_KIND_SESSION: "session",
+    WM_KIND_GLOBAL: "global",
+    WM_KIND_TASK: "task",
+}
+WM_KIND_BY_NAME = {v: k for k, v in WM_KIND_NAMES.items()}
+
+WM_OK = 0
+WM_ERR_ARGS = -1
+WM_ERR_NO_SPACE = -2
+WM_ERR_NOT_FOUND = -3
+WM_ERR_LOW_IMP = -5
+
+# commit consolidation blends: how much workspace context is mixed
+# into the committed memory vector
+WM_COMMIT_BLEND = {
+    "default": 0.30,
+    "creative": 0.15,
+    "maintenance": 0.50,
+}
+
+WM_COMMIT_IMPORTANCE_FLOOR = 0.5
+WM_DEFAULT_ALPHA = 0.5
