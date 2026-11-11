@@ -1503,8 +1503,8 @@ static int quickselect_inplace(float *a, int lo, int hi, int k) {
  * entries the distribution is meaningless, so we fall back to the
  * fixed fields from createMemorySystem.
  */
-static void promotionThresholds(MemorySystem *system, float *mt_threshold,
-                                float *lt_threshold) {
+void promotionThresholds(MemorySystem *system, float *mt_threshold,
+                         float *lt_threshold) {
   int n = (int)system->size;
   if (n < 20) {
     *mt_threshold = system->hierarchy.medium_term.importance_threshold;

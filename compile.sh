@@ -1,3 +1,4 @@
 gcc -shared -fPIC -o neural_web.so \
-neural_web.c immitrin_functions.c \
+neural_web.c workspace_wm.c immitrin_functions.c \
 -ljson-c
+
