@@ -39,8 +39,8 @@ static int wmFindSlot(Workspace *ws, const char *label) {
   if (!ws || !label)
     return -1;
   for (int i = 0; i < WM_MAX_SLOTS; i++) {
-    if (ws->slots[i].used && strncmp(ws->slots[i].label, label,
-                                     WM_LABEL_SIZE) == 0)
+    if (ws->slots[i].used &&
+        strncmp(ws->slots[i].label, label, WM_LABEL_SIZE) == 0)
       return i;
   }
   return -1;
@@ -122,9 +122,9 @@ static void wmSeedContext(Workspace *ws, const float *query,
         MemoryEntry *e = &tier->entries[i];
         float score;
         if (query) {
-          score = computeCosineSimilarity(e->vector, query,
-                                          MEMORY_VECTOR_SIZE) *
-                  (0.5f + e->importance);
+          score =
+              computeCosineSimilarity(e->vector, query, MEMORY_VECTOR_SIZE) *
+              (0.5f + e->importance);
         } else {
           score = e->importance;
         }
@@ -151,8 +151,8 @@ static void wmSeedContext(Workspace *ws, const float *query,
       total += top_score[k];
     if (total > 1e-6f) {
       for (int k = 0; k < ntop; k++)
-        addWeightedVector(ws->context_vector, top_vec[k],
-                          top_score[k] / total, MEMORY_VECTOR_SIZE);
+        addWeightedVector(ws->context_vector, top_vec[k], top_score[k] / total,
+                          MEMORY_VECTOR_SIZE);
     }
   }
   normalizeVector(ws->context_vector, CONTEXT_VECTOR_SIZE);
@@ -163,8 +163,8 @@ static void wmSeedContext(Workspace *ws, const float *query,
  * feature head, workspace context as context_vector) and updateContext
  * folds them into global_context, the existing maintenance path.
  */
-static void wmSyncFocus(Workspace *ws, WorkingMemorySystem *wm,
-                        const int *sel, int n) {
+static void wmSyncFocus(Workspace *ws, WorkingMemorySystem *wm, const int *sel,
+                        int n) {
   if (!wm)
     return;
   for (unsigned int i = 0; i < wm->focus.size; i++) {
@@ -180,8 +180,7 @@ static void wmSyncFocus(Workspace *ws, WorkingMemorySystem *wm,
     WMSlot *slot = &ws->slots[sel[s]];
     WorkingMemoryEntry *e = &wm->focus.entries[wm->focus.size];
     e->features = (float *)calloc(FEATURE_VECTOR_SIZE, sizeof(float));
-    e->context_vector =
-        (float *)calloc(CONTEXT_VECTOR_SIZE, sizeof(float));
+    e->context_vector = (float *)calloc(CONTEXT_VECTOR_SIZE, sizeof(float));
     if (!e->features || !e->context_vector) {
       free(e->features);
       free(e->context_vector);
@@ -190,8 +189,7 @@ static void wmSyncFocus(Workspace *ws, WorkingMemorySystem *wm,
       continue;
     }
     // MEMORY_VECTOR_SIZE < FEATURE_VECTOR_SIZE, tail stays zeroed
-    memcpy(e->features, slot->vector,
-           MEMORY_VECTOR_SIZE * sizeof(float));
+    memcpy(e->features, slot->vector, MEMORY_VECTOR_SIZE * sizeof(float));
     memcpy(e->context_vector, ws->context_vector,
            CONTEXT_VECTOR_SIZE * sizeof(float));
     e->abstraction_level = slot->importance;
@@ -211,45 +209,37 @@ static void wmStoreEntry(MemorySystem *mem, const MemoryEntry *entry) {
   MemoryEntry e = *entry;
 
   if (e.importance >= lt_threshold) {
-    if (mem->hierarchy.long_term.size <
-        mem->hierarchy.long_term.capacity) {
-      mem->hierarchy.long_term
-          .entries[mem->hierarchy.long_term.size++] = e;
+    if (mem->hierarchy.long_term.size < mem->hierarchy.long_term.capacity) {
+      mem->hierarchy.long_term.entries[mem->hierarchy.long_term.size++] = e;
     } else {
       unsigned int rc = 0;
-      int *li = findLeastImportantMemory(
-          mem->hierarchy.long_term.entries,
-          mem->hierarchy.long_term.size, 5, &rc);
+      int *li = findLeastImportantMemory(mem->hierarchy.long_term.entries,
+                                         mem->hierarchy.long_term.size, 5, &rc);
       if (li && rc > 0)
         mem->hierarchy.long_term.entries[li[0]] = e;
       free(li);
     }
   } else if (e.importance >= mt_threshold) {
-    if (mem->hierarchy.medium_term.size <
-        mem->hierarchy.medium_term.capacity) {
-      mem->hierarchy.medium_term
-          .entries[mem->hierarchy.medium_term.size++] = e;
+    if (mem->hierarchy.medium_term.size < mem->hierarchy.medium_term.capacity) {
+      mem->hierarchy.medium_term.entries[mem->hierarchy.medium_term.size++] = e;
     } else {
       unsigned int rc = 0;
-      int *li = findLeastImportantMemory(
-          mem->hierarchy.medium_term.entries,
-          mem->hierarchy.medium_term.size, 3, &rc);
+      int *li =
+          findLeastImportantMemory(mem->hierarchy.medium_term.entries,
+                                   mem->hierarchy.medium_term.size, 3, &rc);
       if (li && rc > 0 &&
-          e.importance >
-              mem->hierarchy.medium_term.entries[li[0]].importance)
+          e.importance > mem->hierarchy.medium_term.entries[li[0]].importance)
         mem->hierarchy.medium_term.entries[li[0]] = e;
       free(li);
     }
   } else {
-    if (mem->hierarchy.short_term.size <
-        mem->hierarchy.short_term.capacity) {
-      mem->hierarchy.short_term
-          .entries[mem->hierarchy.short_term.size++] = e;
+    if (mem->hierarchy.short_term.size < mem->hierarchy.short_term.capacity) {
+      mem->hierarchy.short_term.entries[mem->hierarchy.short_term.size++] = e;
     } else {
       unsigned int rc = 0;
-      int *li = findLeastImportantMemory(
-          mem->hierarchy.short_term.entries,
-          mem->hierarchy.short_term.size, 5, &rc);
+      int *li =
+          findLeastImportantMemory(mem->hierarchy.short_term.entries,
+                                   mem->hierarchy.short_term.size, 5, &rc);
       if (li && rc > 0)
         mem->hierarchy.short_term.entries[li[0]] = e;
       free(li);
@@ -267,8 +257,7 @@ static void wmStoreEntry(MemorySystem *mem, const MemoryEntry *entry) {
 }
 
 WorkspacePool *createWorkspacePool(void) {
-  WorkspacePool *pool =
-      (WorkspacePool *)calloc(1, sizeof(WorkspacePool));
+  WorkspacePool *pool = (WorkspacePool *)calloc(1, sizeof(WorkspacePool));
   if (!pool) {
     fprintf(stderr, "Failed to allocate workspace pool\n");
     return NULL;
@@ -308,9 +297,8 @@ static int wmAllocRaw(WorkspacePool *pool, unsigned int kind,
  * task workspaces cap at WM_TASK_CAP - further allocate is refused so
  * the caller commits or discards instead of juggling parallel buffers.
  */
-int createWorkspace(WorkspacePool *pool, unsigned int kind,
-                    const float *query, MemorySystem *mem,
-                    unsigned int step) {
+int createWorkspace(WorkspacePool *pool, unsigned int kind, const float *query,
+                    MemorySystem *mem, unsigned int step) {
   if (!pool || kind > WM_KIND_TASK)
     return WM_ERR_ARGS;
   if (kind != WM_KIND_SESSION && !wmFindByKind(pool, WM_KIND_SESSION))
@@ -382,9 +370,8 @@ int writeSlot(WorkspacePool *pool, unsigned int id, const char *label,
   }
   memcpy(s->vector, vector, MEMORY_VECTOR_SIZE * sizeof(float));
   wmSanitizeVector(s->vector, MEMORY_VECTOR_SIZE);
-  s->importance = isfinite(importance)
-                      ? fmaxf(0.0f, fminf(1.0f, importance))
-                      : 0.5f;
+  s->importance =
+      isfinite(importance) ? fmaxf(0.0f, fminf(1.0f, importance)) : 0.5f;
   s->step_tag = step;
   s->used = true;
   wmCountSlots(ws);
@@ -395,9 +382,8 @@ int writeSlot(WorkspacePool *pool, unsigned int id, const char *label,
   return idx;
 }
 
-int transformSlot(WorkspacePool *pool, unsigned int id,
-                  const char *label, const float *target, float alpha,
-                  unsigned int step) {
+int transformSlot(WorkspacePool *pool, unsigned int id, const char *label,
+                  const float *target, float alpha, unsigned int step) {
   if (!pool || !label || !target)
     return WM_ERR_ARGS;
   Workspace *ws = wmFindWorkspace(pool, id);
@@ -437,9 +423,8 @@ int linkSlots(WorkspacePool *pool, unsigned int id, const char *a,
     weight = 0.5f;
   for (int i = 0; i < WM_MAX_LINKS; i++) {
     WMLink *l = &ws->links[i];
-    if (l->used &&
-        ((l->a == (unsigned int)ia && l->b == (unsigned int)ib) ||
-         (l->a == (unsigned int)ib && l->b == (unsigned int)ia))) {
+    if (l->used && ((l->a == (unsigned int)ia && l->b == (unsigned int)ib) ||
+                    (l->a == (unsigned int)ib && l->b == (unsigned int)ia))) {
       if (type) {
         strncpy(l->type, type, WM_LABEL_SIZE - 1);
         l->type[WM_LABEL_SIZE - 1] = '\0';
@@ -481,9 +466,9 @@ int linkSlots(WorkspacePool *pool, unsigned int id, const char *a,
  * workspace's own slots, top-k promoted into work_mem focus. Not a
  * world search - persistent recall stays larkos_recall's job.
  */
-int wmRetrieve(WorkspacePool *pool, unsigned int id, const float *query,
-               int k, WorkingMemorySystem *wm, unsigned int step,
-               int *out_idx, float *out_score, int max_out) {
+int wmRetrieve(WorkspacePool *pool, unsigned int id, const float *query, int k,
+               WorkingMemorySystem *wm, unsigned int step, int *out_idx,
+               float *out_score, int max_out) {
   if (!pool || !query)
     return WM_ERR_ARGS;
   Workspace *ws = wmFindWorkspace(pool, id);
@@ -545,9 +530,8 @@ int wmRetrieve(WorkspacePool *pool, unsigned int id, const float *query,
   return n;
 }
 
-int wmCommitSlot(WorkspacePool *pool, unsigned int id,
-                 const char *label, MemorySystem *mem,
-                 unsigned int step, float blend) {
+int wmCommitSlot(WorkspacePool *pool, unsigned int id, const char *label,
+                 MemorySystem *mem, unsigned int step, float blend) {
   if (!pool || !mem || !label)
     return WM_ERR_ARGS;
   Workspace *ws = wmFindWorkspace(pool, id);
@@ -594,9 +578,9 @@ int wmCommitSlot(WorkspacePool *pool, unsigned int id,
  * softer bands only flag. out_* arrays are indexed by the PRE-validation
  * slot positions, parallel to the workspace struct the caller holds.
  */
-int wmValidateWorkspace(WorkspacePool *pool, unsigned int id,
-                        MemorySystem *mem, int *out_idx, int *out_flag,
-                        float *out_coh, float *out_cons, int max_out) {
+int wmValidateWorkspace(WorkspacePool *pool, unsigned int id, MemorySystem *mem,
+                        int *out_idx, int *out_flag, float *out_coh,
+                        float *out_cons, int max_out) {
   Workspace *ws = wmFindWorkspace(pool, id);
   if (!ws || !out_idx || !out_flag || !out_coh || !out_cons)
     return WM_ERR_ARGS;
@@ -611,12 +595,10 @@ int wmValidateWorkspace(WorkspacePool *pool, unsigned int id,
     float cons = 0.0f;
     if (mem) {
       MemoryCluster *lt = &mem->hierarchy.long_term;
-      unsigned int ln =
-          lt->size < lt->capacity ? lt->size : lt->capacity;
+      unsigned int ln = lt->size < lt->capacity ? lt->size : lt->capacity;
       float best = -1.0f;
       for (unsigned int j = 0; j < ln; j++) {
-        float c = computeCosineSimilarity(s->vector,
-                                          lt->entries[j].vector,
+        float c = computeCosineSimilarity(s->vector, lt->entries[j].vector,
                                           MEMORY_VECTOR_SIZE) *
                   (0.5f + lt->entries[j].importance) / 1.5f;
         if (c > best)
@@ -657,9 +639,8 @@ int wmValidateWorkspace(WorkspacePool *pool, unsigned int id,
   return n;
 }
 
-int wmDiscardSlot(WorkspacePool *pool, unsigned int id,
-                  const char *label, float *out_importance,
-                  unsigned int step) {
+int wmDiscardSlot(WorkspacePool *pool, unsigned int id, const char *label,
+                  float *out_importance, unsigned int step) {
   if (!pool || !label)
     return WM_ERR_ARGS;
   Workspace *ws = wmFindWorkspace(pool, id);
@@ -681,22 +662,19 @@ int wmDiscardSlot(WorkspacePool *pool, unsigned int id,
  * step-tagged history ring, oldest first.
  */
 int replayWorkspace(WorkspacePool *pool, unsigned int id,
-                    unsigned int from_step, WMSlotSnapshot *out,
-                    int max_out) {
+                    unsigned int from_step, WMSlotSnapshot *out, int max_out) {
   Workspace *ws = wmFindWorkspace(pool, id);
   if (!ws)
     return WM_ERR_NOT_FOUND;
   if (max_out <= 0)
     return 0;
-  unsigned int stored = ws->history_count < WM_HISTORY_SIZE
-                            ? ws->history_count
-                            : WM_HISTORY_SIZE;
+  unsigned int stored =
+      ws->history_count < WM_HISTORY_SIZE ? ws->history_count : WM_HISTORY_SIZE;
   unsigned int start =
       (ws->history_head + WM_HISTORY_SIZE - stored) % WM_HISTORY_SIZE;
   int n = 0;
   for (unsigned int i = 0; i < stored && n < max_out; i++) {
-    WMSlotSnapshot *snap =
-        &ws->history[(start + i) % WM_HISTORY_SIZE];
+    WMSlotSnapshot *snap = &ws->history[(start + i) % WM_HISTORY_SIZE];
     if (snap->step < from_step)
       continue;
     if (out)
@@ -707,8 +685,7 @@ int replayWorkspace(WorkspacePool *pool, unsigned int id,
 }
 
 bool validateWorkspacePool(WorkspacePool *pool) {
-  if (!validateMemoryBlock(pool, sizeof(WorkspacePool),
-                           "WorkspacePool")) {
+  if (!validateMemoryBlock(pool, sizeof(WorkspacePool), "WorkspacePool")) {
     return false;
   }
   if (pool->next_id > 100000000u)
@@ -724,8 +701,7 @@ bool validateWorkspacePool(WorkspacePool *pool) {
     if (!ws->active)
       continue;
     if (ws->kind > WM_KIND_TASK) {
-      fprintf(stderr,
-              "WARNING: Workspace %u has invalid kind, dropped\n",
+      fprintf(stderr, "WARNING: Workspace %u has invalid kind, dropped\n",
               ws->workspace_id);
       memset(ws, 0, sizeof(Workspace));
       continue;
@@ -750,8 +726,7 @@ void saveWorkspacePool(WorkspacePool *pool, const char *filename) {
     return;
   FILE *fp = fopen(filename, "wb");
   if (fp == NULL) {
-    fprintf(stderr,
-            "Error opening workspace pool file for writing\n");
+    fprintf(stderr, "Error opening workspace pool file for writing\n");
     return;
   }
   uint32_t magic = WM_POOL_MAGIC;
@@ -770,12 +745,10 @@ WorkspacePool *loadWorkspacePool(const char *filename) {
     return NULL;
   uint32_t magic = 0;
   uint32_t version = 0;
-  if (fread(&magic, sizeof(magic), 1, fp) != 1 ||
-      magic != WM_POOL_MAGIC ||
+  if (fread(&magic, sizeof(magic), 1, fp) != 1 || magic != WM_POOL_MAGIC ||
       fread(&version, sizeof(version), 1, fp) != 1 ||
       version != WM_POOL_VERSION) {
-    fprintf(stderr,
-            "Workspace pool file bad magic/version, ignoring\n");
+    fprintf(stderr, "Workspace pool file bad magic/version, ignoring\n");
     fclose(fp);
     return NULL;
   }
