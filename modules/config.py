@@ -76,6 +76,14 @@ FUSE_GRAPH_NHEAD  = 8
 FUSE_GRAPH_LAYERS = 3
 FUSE_GRAPH_DIM_FF = 512
 
+# Memory entries handed to the C-side cognitive_fuse, sampled by
+# importance. With MEMORY_CAPACITY at 1M the serialized tiers can
+# carry tens of thousands of entries; marshalling all of them through
+# ctypes every step is pure overhead when the fusion attention only
+# ever weighs the salient tail anyway. The C side already takes
+# m_count as a runtime arg, so no recompile is needed.
+FUSION_MEM_TOP_K = 1024
+
 # Neuron-graph attention layer. Hand-rolled GAT over the MAX_NEURONS
 # graph exposed by backend_state.get_neurons().
 GAT_HEADS  = 4
@@ -116,6 +124,14 @@ TEXT_COLUMN_HINTS = (
 # Backend shared constants — auto-derives from INPUT_SIZE and MAX_NEURONS
 MAX_CONNECTIONS    = 32
 MEMORY_VECTOR_SIZE = 2 * MAX_NEURONS + INPUT_SIZE  # 288
+
+# Hard cap on how many entries per level serialize_state will marshal
+# into Python dicts. With MEMORY_CAPACITY at 1M a full serialization
+# would build ~30k+ dicts of 288 floats PER CALL (journal joins, API
+# status, output prompt, cognitive_fuse sampling all read it), so the
+# entry list is truncated while size/capacity stay truthful. Consumers
+# that only need counts use serialize_stats instead.
+MAX_SERIALIZED_ENTRIES = 10_000
 
 # Input tensor builder, EDIT THIS when you change INPUT_SIZE / MAX_NEURONS
 def build_input_tensor(
