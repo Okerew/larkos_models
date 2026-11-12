@@ -7,8 +7,7 @@ from ctypes import (
     c_float, c_int, c_uint,
 )
 
-from modules.config import DEVICE, MAX_CONNECTIONS, MEMORY_VECTOR_SIZE, FUSION_MEM_TOP_K
-from modules.backend.memory import MAX_SERIALIZED_ENTRIES
+from modules.config import DEVICE, MAX_CONNECTIONS, MEMORY_VECTOR_SIZE,  MAX_SERIALIZED_ENTRIES, FUSION_MEM_TOP_K
 
 _LIB_PATH = pathlib.Path(__file__).parent / "libfusion.so"
 _lib: CDLL | None = None

@@ -12,6 +12,7 @@ from modules.config import (
     FEATURE_VECTOR_SIZE,
     CONTEXT_VECTOR_SIZE,
     MEMORY_CAPACITY,
+    MAX_SERIALIZED_ENTRIES
 )
 
 
@@ -107,15 +108,6 @@ class WorkingMemorySystem(Structure):
 
 
 FeatureMatrix = (c_float * MEMORY_VECTOR_SIZE) * FEATURE_VECTOR_SIZE
-
-# Hard cap on how many entries per level serialize_state will marshal
-# into Python dicts. With MEMORY_CAPACITY at 1M a full serialization
-# would build ~30k+ dicts of 288 floats PER CALL (journal joins, API
-# status, output prompt, cognitive_fuse sampling all read it), so the
-# entry list is truncated while size/capacity stay truthful. Consumers
-# that only need counts use serialize_stats instead.
-MAX_SERIALIZED_ENTRIES = 10_000
-
 
 def bind(lib: CDLL):
     lib.createMemorySystem.argtypes = [c_uint]
